@@ -1,0 +1,10 @@
+build-essential
+libgl1-mesa-glx
+libglib2.0-0
+libsm6
+libxext6
+libxrender-dev
+libfreetype6-dev
+libpng-dev
+python3.12-dev
+python3.12-venv
