@@ -1,1329 +1,2395 @@
-# risk_assessment.py
-# Combined Risk Assessment + ESGFP + MCDA + Validation + Compliance/ESG TEA
-# Generated in 5 chunks — paste them sequentially into a single file.
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec  1 11:38:26 2025
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Sequence, Optional, Any
-import sys
-import math
-import re
-import random
-import os
-import io
-import json
-import tempfile
-import importlib.util
-from types import ModuleType
-from datetime import datetime
+@author: a1917785
+"""
 
-import streamlit as st
+# -*- coding: utf-8 -*-
+"""
+Commercial / Ex-ante TEA tool with:
+- Mode selection: Commercial TEA vs Ex-ante TEA
+- Multi-design comparison
+- Per-design TEA (CAPEX, LCOx, NPV, IRR, Payback, CRF, Salvage)
+- Depreciation methods (SL, SYD, DDB) + salvage + CRF
+- Cost–Benefit Analysis (CBA):
+    * Discounted revenues vs discounted costs
+    * Benefit–Cost Ratio (BCR)
+- Scenario analysis (Optimistic / Moderate / Pessimistic) with visualisations
+- Visualisations:
+  * Annual cashflow (coloured bars)
+  * Cumulative cashflow + payback marker
+  * Discounted cashflow vs year (+ cumulative discounted CF)
+  * CAPEX breakdown (direct & indirect)
+  * OPEX breakdown pie (DOC / FOC / GMC / risk / CO₂ / ESG)
+  * Tornado sensitivity (NPV & LCOx)
+  * Monte Carlo distributions (LCOx, NPV, IRR)
+  * Price sweep and RM-cost sweep
+  * Critical multi-colour pairwise impact plots
+  * Income Statement (per-year Revenue, OPEX, EBITDA, Depreciation, EBIT, Tax, Net Income)
+- Interactive editing:
+  * After each run, user can change any numeric parameter and re-run
+
+ADDED:
+- ROI calculation (total and average annual) and yearly ROI (%)
+- EBIT & EBITDA graphs
+- ROI graph
+- ESG/compliance/regulatory OPEX cost (f_esg) with region defaults
+- Scenario profit impact of ESG swings (Avg_Profit + ΔProfit%)
+- NPV test vs discount rate, giving a "Theoretical IRR" (NPV = 0) vs "Project IRR" and plotting both.
+
+NEW IN THIS VERSION:
+- ESG/compliance sweep (5%→75% of base OPEX) with multiple visualisations:
+  OPEX, IRR, NPV, SELLING PRICE (to hold base IRR), ROI (total & avg), Revenue, EBITDA, EBIT, Payback
+  + Critical multi-colour %Δ scatter vs %Δ f_esg
+"""
+
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
-import plotly.express as px
-import plotly.graph_objects as go
-from PIL import Image
+import pandas as pd
 
-# PDF tools
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
-    Table as RLTable, TableStyle, PageBreak
-)
 
-# ----------------------- Plot style (professional) ------------------
-def apply_pro_style() -> None:
-    plt.rcParams.update({
-        "font.size": 11,
-        "axes.titlesize": 14,
-        "axes.labelsize": 12,
-        "legend.fontsize": 10,
-        "figure.titlesize": 16,
-        "axes.grid": True,
-        "grid.linestyle": "--",
-        "grid.linewidth": 0.5,
-        "axes.axisbelow": True,
-        "figure.figsize": (10, 6),
-    })
-
-# ----------------------- Data models -----------------------
-@dataclass
-class Risk:
-    name: str
-    probability: float  # (0,1]
-    severity: float     # [1,10]
-
-    @property
-    def rating(self) -> float:
-        return self.probability * self.severity
-
-# ----------------------- Constants -------------------------
-DEFAULT_ESGFP: Dict[str, List[str]] = {
-    "Environmental": ["GHG Emissions", "Water Use", "Waste Management"],
-    "Social": ["Labor Safety", "Community Impact"],
-    "Governance": ["Compliance", "Transparency"],
-    "Financial": ["CAPEX", "OPEX", "ROI"],
-    "Process": ["Efficiency", "Flexibility", "Scalability"],
+# ======================================================================
+#  Beginner-friendly help text for key parameters
+# ======================================================================
+PARAM_HELP = {
+    "C_PE": (
+        "Purchased Equipment Cost (USD).\n"
+        "- This is the base cost of major process equipment before installation.\n"
+        "- Usually taken from your CAPEX sheet or vendor quotes.\n"
+        "- All direct and indirect capital factors (installation, piping, buildings, etc.) "
+        "are multiplied from this number."
+    ),
+    "COL": (
+        "Annual Operating Labour Cost (USD/year).\n"
+        "- Total yearly cost of operators, technicians, shift supervisors, etc.\n"
+        "- Include salaries + benefits + overtime if known.\n"
+        "- This feeds OPEX via DOC, FOC and GMC correlations."
+    ),
+    "C_RM": (
+        "Annual Raw Material Cost (USD/year).\n"
+        "- Sum of all feedstock costs (natural gas, CO₂, H₂, water, chemicals, etc.).\n"
+        "- For ex-ante mode this is calculated from cost intensity × production."
+    ),
+    "C_UT": (
+        "Annual Utilities Cost (USD/year).\n"
+        "- Electricity, steam, cooling water, instrument air, nitrogen, etc.\n"
+        "- For ex-ante mode this is cost intensity × production."
+    ),
+    "C_CAT": (
+        "Annual Catalyst / Membrane / Sorbent Make-up Cost (USD/year).\n"
+        "- Include periodic catalyst replacements, specialty membranes, sorbents, etc."
+    ),
+    "Q_prod": (
+        "Annual Product Output (ton/year).\n"
+        "- Net saleable product leaving the plant, after internal recycle/purge.\n"
+        "- Used to compute revenue and LCOx = OPEX / Q_prod."
+    ),
+    "P_prod": (
+        "Selling Price (USD/ton of product).\n"
+        "- Realistic average selling price over the project horizon.\n"
+        "- Used to calculate gross annual revenue: R = Q_prod × P_prod."
+    ),
+    "f_ins": (
+        "Installation Factor (fraction of C_PE).\n"
+        "- Covers foundations, supports, erection, hook-up, etc.\n"
+        "- Typical range 0.2–0.5 depending on complexity."
+    ),
+    "f_pipe": (
+        "Piping Factor (fraction of C_PE).\n"
+        "- Includes piping, valves, fittings, painting, insulation.\n"
+        "- Often 0.3–0.8 depending on how pipe-intensive the plant is."
+    ),
+    "f_elec": (
+        "Electrical Factor (fraction of C_PE).\n"
+        "- Motor control centres, cabling, lighting, etc."
+    ),
+    "f_bldg": (
+        "Buildings Factor (fraction of C_PE).\n"
+        "- Control rooms, admin buildings, workshop, etc."
+    ),
+    "f_util": (
+        "Utilities Factor (fraction of C_PE).\n"
+        "- Utility generation and distribution (boilers, chillers, etc.)."
+    ),
+    "f_stor": (
+        "Storage Factor (fraction of C_PE).\n"
+        "- Storage tanks, silos, bullets, etc. for product and feeds."
+    ),
+    "f_safe": (
+        "Safety Factor (fraction of C_PE).\n"
+        "- Firefighting, safety systems, ESD, alarms."
+    ),
+    "f_waste": (
+        "Waste Treatment Factor (fraction of C_PE).\n"
+        "- Off-gas treatment, wastewater treatment, solid waste handling equipment."
+    ),
+    "f_eng": (
+        "Engineering Fraction (fraction of Direct Capital Cost).\n"
+        "- Detail engineering, design, project management."
+    ),
+    "f_cons": (
+        "Construction Supervision (fraction of DCC).\n"
+        "- Site supervision, construction management."
+    ),
+    "f_licn": (
+        "Licensing Fraction (fraction of DCC or CAPEX).\n"
+        "- Technology license fees, patents, process know-how."
+    ),
+    "f_cont": (
+        "Contractor Overhead + Profit (fraction of DCC).\n"
+        "- EPC/EPCM contractor margin and indirect overhead."
+    ),
+    "f_contg": (
+        "Contingency (fraction of DCC).\n"
+        "- Covers unknowns, scope growth, early-stage uncertainty."
+    ),
+    "f_insur": (
+        "Insurance (fraction of DCC).\n"
+        "- Annual plant insurance used in OPEX and CAPEX correlations."
+    ),
+    "f_own": (
+        "Owner’s Cost (fraction of DCC).\n"
+        "- Owner’s internal project team, training, pre-ops, land, etc."
+    ),
+    "f_start": (
+        "Start-up & Commissioning (fraction of DCC).\n"
+        "- Costs of commissioning, start-up trials, initial consumables."
+    ),
+    "L_asset": (
+        "Asset / Depreciation Life (years).\n"
+        "- The accounting life over which CAPEX is depreciated.\n"
+        "- Typical 15–25 years for large chemical plants.\n"
+        "- Affects tax shield via depreciation schedule."
+    ),
+    "N_project": (
+        "Project Horizon / Plant Operating Life (years).\n"
+        "- Number of operating years used in NPV, IRR and CBA.\n"
+        "- After N_project, the plant is assumed to stop and salvage is recovered."
+    ),
+    "tau_inc": (
+        "Income Tax Fraction (0–1).\n"
+        "- Corporate income tax rate on positive taxable earnings.\n"
+        "- Only applied when Earnings Before Tax (EBT) > 0."
+    ),
+    "i_base": (
+        "Base Discount Rate (decimal).\n"
+        "- Firm-level weighted average cost of capital (WACC) or hurdle rate.\n"
+        "- Does NOT include project-specific risk yet."
+    ),
+    "delta_risk": (
+        "Risk Premium Addition to Discount Rate (decimal).\n"
+        "- Extra project/technology/market risk on top of i_base.\n"
+        "- Effective discount rate = i_base + delta_risk.\n"
+        "- For FOAK or high-risk methanol projects, values like 0.02–0.08 are common."
+    ),
+    "dep_method": (
+        "Depreciation Method (SL, SYD, DDB).\n"
+        "- SL  = Straight-line (equal depreciation each year).\n"
+        "- SYD = Sum-of-years-digits (front-loaded).\n"
+        "- DDB = Double-declining-balance (strongly front-loaded)."
+    ),
+    "salv_frac": (
+        "Salvage Value Fraction of CAPEX (0–1).\n"
+        "- Fraction of total capital cost recovered at end of project.\n"
+        "- Salvage is discounted and included in NPV and annualised CAPEX."
+    ),
+    "f_risk_op": (
+        "Operational Risk Factor (fraction of DOC).\n"
+        "- Models real-world under-performance vs nameplate: extra downtime,\n"
+        "  start-up issues, more frequent maintenance, operator errors, etc.\n"
+        "- Implemented as an additional cost = f_risk_op × DOC.\n"
+        "- Typical ranges:\n"
+        "   • Mature, stable plant: 0.02–0.05\n"
+        "   • New / FOAK / complex process: 0.08–0.15 or higher."
+    ),
+    "tau_CO2": (
+        "Carbon Tax (USD/ton CO₂).\n"
+        "- Applies to annual CO₂ emissions (E_CO2).\n"
+        "- Captures carbon pricing or emission trading costs in OPEX."
+    ),
+    "E_CO2": (
+        "Annual CO₂ Emissions (ton/year).\n"
+        "- Total direct scope 1 process and combustion CO₂ emissions.\n"
+        "- In ex-ante mode, this is computed from specific intensity (tCO₂/t product)."
+    ),
+    "f_pack": (
+        "Packaging as % of Raw Material Cost (fraction).\n"
+        "- Approximates packaging cost using C_RM as base."
+    ),
+    "f_esg": (
+        "Compliance / ESG / regulatory operating cost as a fraction of base operating cost.\n"
+        "- C_ESG = f_esg × OPEX_base, where OPEX_base = DOC + FOC + GMC + risk_cost + CO₂ cost.\n"
+        "- Region-typical heuristics (literature / industry):\n"
+        "   • North America: ~5–10% of OPEX\n"
+        "   • Europe / UK : ~5–10% of OPEX\n"
+        "   • Asia-Pacific: often >10% of OPEX\n"
+        "- Implemented as an explicit OPEX add-on and shown in the OPEX pie."
+    ),
 }
-EXPOSURE_MAP: Dict[str, float] = {
-    "high": 1.0,
-    "moderate": 0.75,
-    "moderate to lower": 0.5,
-    "lower": 0.25,
-    "1": 1.0,
-    "0.75": 0.75,
-    "0.5": 0.5,
-    "0.25": 0.25,
-}
 
-# Display scaling
-OUTPUT_SCALE = 10.0
-WEIGHTED_THEORETICAL_MAX = 18.0  # e.g., max sub-issue 9 × (1 + 1.0 exposure)
-MIN_DISPLAY_SCORE = 1.0          # score floor (avoid zeros in plots)
 
-# ----------------------- Helper plotting conversions -----------------
-def mpl_fig_to_png_bytes(fig: Figure, dpi: int = 150) -> bytes:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-    buf.seek(0)
-    return buf.getvalue()
-
-def plotly_fig_to_png_bytes(fig, width: int = 900, height: int = 600) -> bytes:
-    # requires kaleido; if not present, this will raise — used only for PDF embedding if available
-    try:
-        img_bytes = fig.to_image(format="png", width=width, height=height, scale=2)
-        return img_bytes
-    except Exception:
-        # fallback: render to PNG via static HTML snapshot not available offline
-        raise
-
-def pil_bytes_to_rlimage(png_bytes: bytes, max_width_mm: float = 170) -> RLImage:
-    img = Image.open(io.BytesIO(png_bytes))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    rl_img = RLImage(buf)
-    max_w_pt = max_width_mm * mm
-    if rl_img.drawWidth > max_w_pt:
-        scale = max_w_pt / rl_img.drawWidth
-        rl_img.drawWidth = rl_img.drawWidth * scale
-        rl_img.drawHeight = rl_img.drawHeight * scale
-    return rl_img
-
-# ----------------------- Load compliance module dynamically -----------------
-DEFAULT_COMPLIANCE_PATH = "model/compliance.py"
-
-def load_compliance_module(path: str) -> ModuleType:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Compliance script not found at {path}")
-    spec = importlib.util.spec_from_file_location("compliance_teawork", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not create import spec for {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore
-    return mod
-
-# ----------------------- Risk section ----------------------
-def risk_dataframe(risks: List[Risk]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [{"Risk": r.name, "Probability": r.probability, "Severity": r.severity, "Rating": r.rating} for r in risks]
-    )
-
-def plot_risk_views(df: pd.DataFrame) -> None:
-    if df.empty:
+def print_param_help(name=None):
+    """
+    Print beginner-friendly help for one parameter, or list all.
+    Use inside the interactive editor by typing:
+      - 'help'          → list all documented parameters
+      - 'help C_PE'     → show help for C_PE
+    """
+    if name is None or str(name).strip() == "":
+        print("\nAvailable parameters with help (use 'help PARAM_NAME' inside the editor):")
+        for k in sorted(PARAM_HELP.keys()):
+            short = PARAM_HELP[k].split("\n", 1)[0]
+            print(f"  {k:10s} - {short}")
         return
-    attrs = df.set_index("Risk")[["Probability", "Severity", "Rating"]]
 
-    # Heatmap
-    fig, ax = plt.subplots(figsize=(8, 6))
-    im = ax.imshow(attrs.values)
-    ax.set_xticks(range(attrs.shape[1]))
-    ax.set_xticklabels(attrs.columns)
-    ax.set_yticks(range(attrs.shape[0]))
-    ax.set_yticklabels(attrs.index)
-    for i in range(attrs.shape[0]):
-        for j in range(attrs.shape[1]):
-            ax.text(j, i, f"{attrs.values[i, j]:.2f}", ha="center", va="center")
-    ax.set_title("Risk Attributes Heatmap")
-    fig.colorbar(im, ax=ax)
-    fig.tight_layout()
-    plt.show()
+    key = str(name).strip()
+    if key in PARAM_HELP:
+        print(f"\n--- Help for {key} ---")
+        print(PARAM_HELP[key])
+    else:
+        print(f"\nNo detailed help stored for '{key}'. "
+              "Check spelling or use 'help' to list all documented parameters.")
 
-    # Bar
-    ax = df.plot(
-        x="Risk", y="Rating", kind="bar", rot=45, figsize=(10, 6), title="Risk Rating Bar Plot", legend=False
-    )
-    ax.set_ylabel("Risk Rating")
-    ax.grid(True)
-    plt.tight_layout()
-    plt.show()
 
-    # Bubble
-    x_min, x_max = 0.0, 1.0
-    y_min, y_max = 1.0, 10.0
-    fig, ax = plt.subplots(figsize=(16, 9))
-    nx, ny = 500, 500
-    gx = np.linspace(x_min, x_max, nx)
-    gy = np.linspace(y_min, y_max, ny)
-    gy01 = (gy - y_min) / (y_max - y_min)
-    Z = gy01[:, None] + gx[None, :]
-    Z = (Z - Z.min()) / (Z.max() - Z.min())
-    ax.imshow(
-        Z, extent=[x_min, x_max, y_min, y_max], origin="lower",
-        cmap="RdYlGn_r", alpha=0.85, aspect="auto", interpolation="bilinear",
-    )
-    x = df["Probability"].to_numpy()
-    y = df["Severity"].to_numpy()
-    r = df["Rating"].to_numpy()
-    labels = df["Risk"].astype(str).to_list()
-    sizes = np.clip(r, 0.05, None) * 600.0
-    ax.scatter(x, y, s=sizes, edgecolors="black", linewidths=0.8, alpha=0.95, zorder=3)
-    for xi, yi, lab in zip(x, y, labels):
-        offset_x = 18 if xi < 0.7 else -18
-        ha = "left" if xi < 0.7 else "right"
-        ax.annotate(
-            lab, xy=(xi, yi), xytext=(offset_x, 10), textcoords="offset points",
-            ha=ha, va="bottom", fontsize=13, color="black",
-            arrowprops=dict(arrowstyle="-", color="gray", lw=0.9, alpha=0.9),
-            zorder=4,
-        )
-    ax.set_xlim(x_min, x_max)
-    ax.set_ylim(y_min, y_max)
-    ax.set_xlabel("Probability (Likelihood)")
-    ax.set_ylabel("Severity (Impact)")
-    ax.set_title("Materiality Assessment Diagram – Likelihood × Impact")
-    ax.grid(False)
-    plt.tight_layout()
-    plt.show()
+# ======================================================================
+#  Helper: numeric input with default and bounds
+# ======================================================================
+def ask_float(prompt, default=None, min_val=None, max_val=None):
+    """
+    Ask user for a float with optional default and [min, max] clamp.
+    If user enters nothing and default is given, default is used.
+    """
+    while True:
+        raw = input(prompt)
+        if raw.strip() == "":
+            if default is None:
+                print("  Please enter a value.")
+                continue
+            val = default
+        else:
+            try:
+                val = float(raw)
+            except ValueError:
+                print("  Invalid number, try again.")
+                continue
 
-# ----------------------- ESGFP scoring (N technologies) ----
-def _sanitize_filename(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+        if min_val is not None and val < min_val:
+            print(f"  Value below minimum ({min_val}), using min.")
+            val = min_val
+        if max_val is not None and val > max_val:
+            print(f"  Value above maximum ({max_val}), using max.")
+            val = max_val
+        return val
 
-def _norm0_10(values: Sequence[float], base: float = WEIGHTED_THEORETICAL_MAX) -> List[float]:
-    return [(float(v) / base) * OUTPUT_SCALE for v in values]
 
-def collect_esgfp_scores_for_tech(tech_label: str, pillars: Dict[str, List[str]]) -> Dict[str, float]:
-    # CLI helper retained for compatibility; not used in Streamlit automation.
-    print(f"\n📥 ESGFP Scores for {tech_label}")
-    scores: Dict[str, float] = {}
-    for pillar, subs in pillars.items():
-        for sub in subs:
-            # placeholder interactive CLI fallback
-            s = 5.0
-            g = 0.0
-            final = s * (1.0 + g)
-            scores[f"{pillar}:{sub}"] = round(final, 4)
-    return scores
+def interactive_edit_params(params):
+    """
+    Allow user to change any numeric parameter and re-run.
+    Extra: you can type 'help' or 'help PARAM_NAME' to see explanations.
+    """
+    print("\nEditable numeric parameters and current values:")
+    for k, v in params.items():
+        if isinstance(v, (int, float)):
+            print(f"  {k:15s} = {v}")
+    print("\nTip: inside this editor you can type 'help' or 'help PARAM_NAME' "
+          "to see beginner-friendly explanations.")
 
-def pillar_averages_multi(scores_by_tech: Dict[str, Dict[str, float]], pillars: Dict[str, List[str]]) -> pd.DataFrame:
-    techs = list(scores_by_tech.keys())
-    rows = []
-    for pillar, subs in pillars.items():
-        row = {"Pillar": pillar}
-        for tech in techs:
-            vals = [scores_by_tech[tech].get(f"{pillar}:{sub}", 0.0) for sub in subs]
-            row[tech] = float(np.mean(vals)) if vals else 0.0
-        rows.append(row)
-    if not rows:
-        return pd.DataFrame(columns=techs).set_index(pd.Index([], name="Pillar"))
-    return pd.DataFrame(rows).set_index("Pillar")[techs]
+    while True:
+        key = input("\nEnter parameter name to change (or 'help', Enter to stop editing): ").strip()
+        if key == "":
+            break
 
-def plot_pillar_key_issue_comparisons(scores_by_tech: Dict[str, Dict[str, float]], pillars: Dict[str, List[str]]) -> None:
-    techs = list(scores_by_tech.keys())
-    for pillar, subs in pillars.items():
-        if not subs:
+        # Inline help inside the editor
+        low = key.lower()
+        if low == "help" or low == "h" or low == "?":
+            print_param_help()
             continue
-        x = np.arange(len(subs))
-        width = 0.8 / max(len(techs), 1)
-        fig, ax = plt.subplots(figsize=(12, 6))
-        for idx, tech in enumerate(techs):
-            vals = [scores_by_tech[tech].get(f"{pillar}:{sub}", 0.0) for sub in subs]
-            y = _norm0_10(vals)
-            ax.bar(x + (idx - (len(techs) - 1) / 2) * width, y, width=width, label=tech)
-        ax.set_xticks(x)
-        ax.set_xticklabels(subs, rotation=0)
-        ax.set_ylabel("Normalized Score (0–10)")
-        ax.set_title(f"{pillar} – Key Issue Comparison (0–10 normalized)")
-        ax.legend()
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.5)
+        if low.startswith("help "):
+            parts = key.split(None, 1)
+            if len(parts) == 2:
+                print_param_help(parts[1])
+            else:
+                print_param_help()
+            continue
+
+        if key not in params:
+            print("  Unknown parameter name. Please copy exactly from the list. "
+                  "You can also type 'help' to see documented parameters.")
+            continue
+        if not isinstance(params[key], (int, float)):
+            print("  Parameter is not numeric (or is internal); skipping.")
+            continue
+
+        current = params[key]
+        val = ask_float(f"New value for {key} [current {current}]: ", default=current)
+        if key in ["N_project", "L_asset"]:
+            params[key] = int(round(val))
+        else:
+            params[key] = val
+
+    return params
+
+
+# ======================================================================
+#  Core TEA engine (now with cost–benefit outputs & income-statement data)
+# ======================================================================
+def compute_TEA(p):
+    C_PE = p['C_PE']
+
+    # Direct capital
+    C_INS   = p['f_ins']   * C_PE
+    C_PIPE  = p['f_pipe']  * C_PE
+    C_ELEC  = p['f_elec']  * C_PE
+    C_BLDG  = p['f_bldg']  * C_PE
+    C_UTIL  = p['f_util']  * C_PE
+    C_STOR  = p['f_stor']  * C_PE
+    C_SAFE  = p['f_safe']  * C_PE
+    C_WASTE = p['f_waste'] * C_PE
+
+    DCC = C_PE + C_INS + C_PIPE + C_ELEC + C_BLDG + C_UTIL + C_STOR + C_SAFE + C_WASTE
+
+    # Indirect capital
+    C_ENG   = p['f_eng']   * DCC
+    C_CONS  = p['f_cons']  * DCC
+    C_LICN  = p['f_licn']  * DCC
+    C_CONT  = p['f_cont']  * DCC
+    C_CONTG = p['f_contg'] * DCC
+    C_INSUR = p['f_insur'] * DCC
+    C_OWN   = p['f_own']   * DCC
+    C_START = p['f_start'] * DCC
+
+    ICC = C_ENG + C_CONS + C_LICN + C_CONT + C_CONTG + C_INSUR + C_OWN + C_START
+
+    CGR = DCC + ICC          # total CAPEX
+
+    # Depreciation life / salvage
+    N = p['N_project']
+    L = int(round(p['L_asset']))
+    dep_method = p['dep_method']     # 'SL', 'SYD', 'DDB'
+    salv_frac  = p['salv_frac']      # fraction of CAPEX
+    S = salv_frac * CGR              # salvage value at end of project
+    L_eff = max(1, L)
+
+    # average straight-line depreciation (for heuristic OPEX formulas)
+    C_DEP_avg = CGR / L_eff
+    CM_avg = C_DEP_avg + C_INSUR
+
+    # DOC / FOC / GMC heuristic (Peters-style)
+    DOC = (p['COL'] + 0.18*p['COL'] + p['C_RM'] + p['C_UT'] +
+           0.06*CGR + 0.15*p['COL'] + p['C_CAT'] + p['f_pack']*p['C_RM'])
+
+    FOC = (0.708*p['COL'] + 0.036*CGR + 0.032*CGR + p['f_insur']*CGR +
+           C_DEP_avg + 0.13*CM_avg + 0.01*CGR)
+
+    GMC = 0.177*p['COL'] + 0.009*CGR + 0.05*CM_avg + 0.11*CM_avg
+
+    # risk + carbon contributions (for OPEX breakdown)
+    risk_cost = p['f_risk_op'] * DOC
+    co2_cost  = p['tau_CO2'] * p['E_CO2']
+
+    # ---- ESG / compliance / regulatory cost as OPEX add-on ----
+    OC_base = DOC + FOC + GMC + risk_cost + co2_cost
+    f_esg = p.get('f_esg', 0.0)
+    esg_cost = f_esg * OC_base
+    OC = OC_base + esg_cost
+
+    R = p['Q_prod'] * p['P_prod']
+    i_eff = p['i_base'] + p['delta_risk']
+
+    # ---- depreciation schedule for tax ----
+    dep = np.zeros(N+1)   # index 0..N, year 0 = 0
+    basis = CGR - S
+    life = min(L_eff, N)
+
+    method = dep_method.upper()
+    if method not in ("SL", "SYD", "DDB"):
+        method = "SL"
+
+    if method == "SL":
+        if life > 0:
+            d = basis / life
+            for t in range(1, life+1):
+                dep[t] = d
+
+    elif method == "SYD":
+        n = life
+        syd = n * (n + 1) / 2.0
+        for j in range(1, life+1):
+            numerator = n - (j - 1)
+            dep[j] = basis * numerator / syd
+
+    elif method == "DDB":
+        rate = 2.0 / life
+        BV = CGR
+        for j in range(1, life+1):
+            d = rate * BV
+            if BV - d < S:
+                d = BV - S
+            dep[j] = max(0.0, d)
+            BV -= d
+            if BV <= S + 1e-6:
+                break
+
+    # ---- cashflow with depreciation + salvage ----
+    CF = []
+    EBT_schedule = np.zeros(N+1)
+    tax_schedule = np.zeros(N+1)
+
+    for t in range(N+1):
+        if t == 0:
+            CF.append(-CGR)
+            EBT_schedule[t] = 0.0
+            tax_schedule[t] = 0.0
+        else:
+            D_t = dep[t] if t <= N else 0.0
+            EBT = R - OC - D_t
+            tax = p['tau_inc'] * max(0, EBT)
+            CF_t = (EBT - tax) + D_t   # add back depreciation (non-cash)
+            if t == N:
+                CF_t += S              # salvage at end
+            CF.append(CF_t)
+            EBT_schedule[t] = EBT
+            tax_schedule[t] = tax
+
+    NPV = sum(CF[t] / ((1 + i_eff)**t) for t in range(len(CF)))
+
+    # ---- safe IRR via bisection (Project IRR) ----
+    def IRR(cash):
+        cf = np.array(cash, dtype=float)
+        if not (np.any(cf < 0) and np.any(cf > 0)):
+            return 0.0
+
+        def npv(rate):
+            rate = max(rate, -0.999999)
+            rate = min(rate, 10.0)
+            t = np.arange(cf.size, dtype=float)
+            return np.sum(cf / (1.0 + rate)**t)
+
+        r_low, r_high = -0.9, 1.0
+        f_low, f_high = npv(r_low), npv(r_high)
+
+        tries = 0
+        while f_low * f_high > 0 and tries < 20 and r_high < 10.0:
+            r_high += 0.5
+            f_high = npv(r_high)
+            tries += 1
+
+        if f_low * f_high > 0:
+            return 0.0
+
+        for _ in range(80):
+            r_mid = 0.5 * (r_low + r_high)
+            f_mid = npv(r_mid)
+            if abs(f_mid) < 1e-6:
+                return r_mid
+            if f_low * f_mid < 0:
+                r_high, f_high = r_mid, f_mid
+            else:
+                r_low, f_low = r_mid, f_mid
+
+        return r_mid
+
+    irr_val = IRR(CF)
+
+    # ---- CRF and annualised CAPEX (with salvage) ----
+    if i_eff > 0:
+        CRF = i_eff * (1 + i_eff)**N / ((1 + i_eff)**N - 1)
+    else:
+        CRF = 1.0 / N if N > 0 else 0.0
+
+    PV_capital_net = CGR - S / ((1 + i_eff)**N)
+    Annual_CAPEX = PV_capital_net * CRF
+
+    # ---- Cost–Benefit Analysis (economic view, ignoring tax/depr) ----
+    PV_rev = 0.0
+    PV_opex = 0.0
+    if N > 0:
+        for t in range(1, N+1):
+            disc = (1 + i_eff)**t
+            PV_rev  += R  / disc
+            PV_opex += OC / disc
+
+    PV_cost_total = PV_capital_net + PV_opex
+    if PV_cost_total > 0:
+        BCR = PV_rev / PV_cost_total
+    else:
+        BCR = 0.0
+
+    return {
+        "CAPEX": CGR,
+        "LCOx": OC / p['Q_prod'],
+        "NPV": NPV,
+        "IRR": irr_val,
+        "CF": CF,
+        "Salvage": S,
+        "CRF": CRF,
+        "Annual_CAPEX": Annual_CAPEX,
+        # CBA metrics
+        "PV_revenue": PV_rev,
+        "PV_cost_total": PV_cost_total,
+        "BCR": BCR,
+        # extras for engineering visualisation
+        "C_PE": C_PE,
+        "DCC": DCC,
+        "ICC": ICC,
+        "DOC": DOC,
+        "FOC": FOC,
+        "GMC": GMC,
+        "OC": OC,
+        "OC_base": OC_base,
+        "R": R,
+        "risk_cost": risk_cost,
+        "co2_cost": co2_cost,
+        "esg_cost": esg_cost,
+        # income-statement related
+        "dep_schedule": dep,
+        "EBT_schedule": EBT_schedule,
+        "tax_schedule": tax_schedule,
+    }
+
+
+# ======================================================================
+#  Payback time
+# ======================================================================
+def compute_payback(cf):
+    """Simple (undiscounted) payback from cumulative cashflow."""
+    cum = np.cumsum(cf)
+    for t in range(1, len(cum)):
+        if cum[t] >= 0:
+            dy = cum[t] - cum[t-1]
+            if dy != 0:
+                frac = -cum[t-1] / dy
+                return (t - 1) + frac
+            else:
+                return float(t)
+    return None
+
+
+# ======================================================================
+#  Theoretical IRR from NPV test (separate from project IRR)
+# ======================================================================
+def theoretical_irr_from_npv(cash, r_low=-0.9, r_high=1.0, max_iter=80, tol=1e-6):
+    """
+    Solve NPV(r) = 0 directly from the cashflow using bisection.
+    This is the 'Theoretical IRR' from the textbook NPV definition:
+      NPV = Σ_t CF_t / (1+r)^t = 0
+    """
+    cf = np.array(cash, dtype=float)
+    if not (np.any(cf < 0) and np.any(cf > 0)):
+        return 0.0
+
+    def npv(rate):
+        rate = max(rate, -0.999999)
+        rate = min(rate, 10.0)
+        t = np.arange(cf.size, dtype=float)
+        return np.sum(cf / (1.0 + rate)**t)
+
+    f_low = npv(r_low)
+    f_high = npv(r_high)
+
+    tries = 0
+    while f_low * f_high > 0 and tries < 20 and r_high < 10.0:
+        r_high += 0.5
+        f_high = npv(r_high)
+        tries += 1
+
+    if f_low * f_high > 0:
+        return 0.0
+
+    for _ in range(max_iter):
+        r_mid = 0.5 * (r_low + r_high)
+        f_mid = npv(r_mid)
+        if abs(f_mid) < tol:
+            return r_mid
+        if f_low * f_mid < 0:
+            r_high, f_high = r_mid, f_mid
+        else:
+            r_low, f_low = r_mid, f_mid
+
+    return r_mid
+
+
+# ======================================================================
+#  Helper: selling price required to hit a target IRR
+# ======================================================================
+def price_for_target_irr(params, target_irr, tol=1e-4, max_iter=80):
+    """
+    Find the selling price P_prod (USD/ton) required to achieve a target IRR.
+    Returns (P_req, TEA_result_at_P_req) or (None, None) if no bracket is found.
+    """
+    base_params = params.copy()
+    P0 = base_params.get("P_prod", 0.0)
+    if P0 <= 0:
+        return None, None
+
+    def irr_at_price(price):
+        if price <= 0:
+            return -1.0
+        p = base_params.copy()
+        p["P_prod"] = price
+        res = compute_TEA(p)
+        return res["IRR"]
+
+    # Initial bracket around current price
+    p_low = max(1e-6, 0.1 * P0)
+    p_high = 5.0 * P0
+    irr_low = irr_at_price(p_low)
+    irr_high = irr_at_price(p_high)
+
+    # Try to find a bracket where irr_low <= target <= irr_high
+    found = False
+    for _ in range(40):
+        if irr_low > irr_high:
+            # ensure monotonic ordering
+            p_low, p_high = p_high, p_low
+            irr_low, irr_high = irr_high, irr_low
+        if irr_low <= target_irr <= irr_high:
+            found = True
+            break
+        if irr_high < target_irr:
+            # need higher price
+            p_high *= 1.5
+            irr_high = irr_at_price(p_high)
+        elif irr_low > target_irr:
+            # need lower price
+            p_low *= 0.5
+            irr_low = irr_at_price(p_low)
+
+    if not found:
+        return None, None
+
+    # Bisection on price
+    for _ in range(max_iter):
+        p_mid = 0.5 * (p_low + p_high)
+        irr_mid = irr_at_price(p_mid)
+        if abs(irr_mid - target_irr) < tol:
+            p_req = p_mid
+            res_req = compute_TEA({**base_params, "P_prod": p_req})
+            return p_req, res_req
+        if irr_mid < target_irr:
+            p_low, irr_low = p_mid, irr_mid
+        else:
+            p_high, irr_high = p_mid, irr_mid
+
+    # Fallback after max_iter: return mid
+    p_req = 0.5 * (p_low + p_high)
+    res_req = compute_TEA({**base_params, "P_prod": p_req})
+    return p_req, res_req
+
+
+# ======================================================================
+#  Tornado sensitivity (user-defined swing)
+# ======================================================================
+def tornado_sensitivity(base_params, keys, swing=0.2):
+    """
+    Compute tornado-style sensitivity on NPV and LCOx vs chosen input keys.
+    swing = fractional +/- (e.g., 0.2 = ±20%)
+    Also prints a summary table of CAPEX, LCOx, NPV, IRR for base/low/high.
+    """
+    base = compute_TEA(base_params)
+    base_CAPEX = base["CAPEX"]
+    base_LCOx = base["LCOx"]
+    base_NPV = base["NPV"]
+    base_IRR = base["IRR"]
+
+    rows = []
+
+    low_NPV = []
+    high_NPV = []
+    low_LCOx = []
+    high_LCOx = []
+
+    for k in keys:
+        p_low = base_params.copy()
+        p_high = base_params.copy()
+
+        p_low[k] = p_low[k] * (1 - swing)
+        p_high[k] = p_high[k] * (1 + swing)
+
+        r_low = compute_TEA(p_low)
+        r_high = compute_TEA(p_high)
+
+        low_NPV.append(r_low["NPV"])
+        high_NPV.append(r_high["NPV"])
+        low_LCOx.append(r_low["LCOx"])
+        high_LCOx.append(r_high["LCOx"])
+
+        rows.append({
+            "Param": k,
+            "Base_CAPEX": base_CAPEX,
+            "Low_CAPEX": r_low["CAPEX"],
+            "High_CAPEX": r_high["CAPEX"],
+            "Base_LCOx": base_LCOx,
+            "Low_LCOx": r_low["LCOx"],
+            "High_LCOx": r_high["LCOx"],
+            "Base_NPV": base_NPV,
+            "Low_NPV": r_low["NPV"],
+            "High_NPV": r_high["NPV"],
+            "Base_IRR_%": base_IRR*100,
+            "Low_IRR_%": r_low["IRR"]*100,
+            "High_IRR_%": r_high["IRR"]*100
+        })
+
+    df = pd.DataFrame(rows)
+    print("\n--- Tornado sensitivity summary (±{:.0f}% swing) ---".format(swing*100))
+    with pd.option_context('display.max_columns', None):
+        print(df.to_string(index=False,
+                           float_format=lambda x: f"{x:,.3g}"))
+
+    keys_str = [str(k) for k in keys]
+    y_pos = np.arange(len(keys_str))
+
+    # NPV tornado
+    plt.figure(figsize=(8, 5), dpi=200)
+    for i in range(len(keys_str)):
+        xl = min(low_NPV[i], high_NPV[i])
+        xh = max(low_NPV[i], high_NPV[i])
+        plt.hlines(y_pos[i], xl, xh, linewidth=8, color="tab:orange")
+    plt.axvline(base_NPV, linestyle="--", color="tab:blue")
+    plt.yticks(y_pos, keys_str)
+    plt.xlabel("NPV (USD)")
+    plt.title(f"Tornado Sensitivity on NPV (±{int(swing*100)}%)")
+    plt.grid(axis="x", alpha=0.4)
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.show()
+
+    # LCOx tornado
+    plt.figure(figsize=(8, 5), dpi=200)
+    for i in range(len(keys_str)):
+        xl = min(low_LCOx[i], high_LCOx[i])
+        xh = max(low_LCOx[i], high_LCOx[i])
+        plt.hlines(y_pos[i], xl, xh, linewidth=8, color="tab:green")
+    plt.axvline(base_LCOx, linestyle="--", color="tab:red")
+    plt.yticks(y_pos, keys_str)
+    plt.xlabel("LCOx (USD/ton)")
+    plt.title(f"Tornado Sensitivity on LCOx (±{int(swing*100)}%)")
+    plt.grid(axis="x", alpha=0.4)
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.show()
+
+
+# ======================================================================
+#  Monte-Carlo uncertainty
+# ======================================================================
+def monte_carlo_analysis(base_params, runs=1000, dist=None):
+    """
+    Monte Carlo on LCOx, NPV, IRR for a given distribution of inputs.
+    dist = {param_name: sigma_fraction}
+    """
+    if dist is None:
+        dist = {"C_RM": 0.15, "P_prod": 0.10, "E_CO2": 0.30}
+
+    L_list, N_list, I_list = [], [], []
+
+    for _ in range(runs):
+        p = base_params.copy()
+        for k, sigma in dist.items():
+            p[k] = p[k] * np.random.normal(1.0, sigma)
+        res = compute_TEA(p)
+        L_list.append(res["LCOx"])
+        N_list.append(res["NPV"])
+        I_list.append(res["IRR"])
+
+    L = np.array(L_list)
+    N = np.array(N_list)
+    I = np.array(I_list)
+
+    def bands(x):
+        return np.percentile(x, [5, 50, 95])
+
+    L_p = bands(L)
+    N_p = bands(N)
+    I_p = bands(I)
+
+    print("\nMonte-Carlo percentile bands (5%, 50%, 95%)")
+    print(f"LCOx  : {L_p[0]:.2f}  {L_p[1]:.2f}  {L_p[2]:.2f}")
+    print(f"NPV   : {N_p[0]:.2e}  {N_p[1]:.2e}  {N_p[2]:.2e}")
+    print(f"IRR % : {I_p[0]*100:.2f}  {I_p[1]*100:.2f}  {I_p[2]*100:.2f}")
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4), dpi=200)
+
+    ax[0].hist(L, bins=50)
+    for v in L_p:
+        ax[0].axvline(v, linestyle="--", color="black", alpha=0.7)
+    ax[0].set_title("LCOx distribution")
+    ax[0].grid(True, alpha=0.3)
+
+    ax[1].hist(N, bins=50)
+    for v in N_p:
+        ax[1].axvline(v, linestyle="--", color="black", alpha=0.7)
+    ax[1].set_title("NPV distribution")
+    ax[1].grid(True, alpha=0.3)
+
+    ax[2].hist(I, bins=50)
+    for v in I_p:
+        ax[2].axvline(v, linestyle="--", color="black", alpha=0.7)
+    ax[2].set_title("IRR distribution")
+    ax[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def interactive_monte_carlo(base_params):
+    """
+    Ask user for Monte-Carlo settings (runs and % sigmas) and run MC.
+    """
+    runs = int(ask_float("Number of Monte Carlo runs [default 1000, min 100]: ",
+                         default=1000, min_val=100))
+    sigma_rm = ask_float("Std dev for C_RM (%) [default 15]: ", default=15, min_val=0) / 100.0
+    sigma_price = ask_float("Std dev for selling price (%) [default 10]: ", default=10, min_val=0) / 100.0
+    sigma_co2 = ask_float("Std dev for emissions (E_CO2) (%) [default 30]: ", default=30, min_val=0) / 100.0
+
+    dist = {"C_RM": sigma_rm, "P_prod": sigma_price, "E_CO2": sigma_co2}
+    monte_carlo_analysis(base_params, runs=runs, dist=dist)
+
+
+# ======================================================================
+#  Extra visuals: price & raw-material sweeps
+# ======================================================================
+def price_sweep(base_params, swing=0.3, n=25):
+    """
+    Sweep selling price P_prod ± swing and plot NPV & LCOx vs price.
+    """
+    P0 = base_params['P_prod']
+    vals = np.linspace((1 - swing)*P0, (1 + swing)*P0, n)
+    npv_list = []
+    lcox_list = []
+
+    for pval in vals:
+        p = base_params.copy()
+        p['P_prod'] = pval
+        out = compute_TEA(p)
+        npv_list.append(out["NPV"])
+        lcox_list.append(out["LCOx"])
+
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(vals, npv_list, marker="o")
+    plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+    plt.grid(True, alpha=0.3)
+    plt.xlabel("Selling price (USD/ton)")
+    plt.ylabel("NPV (USD)")
+    plt.title("NPV vs Selling Price")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(vals, lcox_list, marker="s")
+    plt.grid(True, alpha=0.3)
+    plt.xlabel("Selling price (USD/ton)")
+    plt.ylabel("LCOx (USD/ton)")
+    plt.title("LCOx vs Selling Price")
+    plt.tight_layout()
+    plt.show()
+
+
+def raw_material_sweep(base_params, swing=0.3, n=25):
+    """
+    Sweep raw-material cost C_RM ± swing and plot NPV & LCOx vs C_RM.
+    """
+    C0 = base_params['C_RM']
+    vals = np.linspace((1 - swing)*C0, (1 + swing)*C0, n)
+    npv_list = []
+    lcox_list = []
+
+    for cval in vals:
+        p = base_params.copy()
+        p['C_RM'] = cval
+        out = compute_TEA(p)
+        npv_list.append(out["NPV"])
+        lcox_list.append(out["LCOx"])
+
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(vals, npv_list, marker="o")
+    plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+    plt.grid(True, alpha=0.3)
+    plt.xlabel("Annual raw-material cost (USD/year)")
+    plt.ylabel("NPV (USD)")
+    plt.title("NPV vs Raw-material Cost")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(vals, lcox_list, marker="s")
+    plt.grid(True, alpha=0.3)
+    plt.xlabel("Annual raw-material cost (USD/year)")
+    plt.ylabel("LCOx (USD/ton)")
+    plt.title("LCOx vs Raw-material Cost")
+    plt.tight_layout()
+    plt.show()
+
+
+# ======================================================================
+#  Critical multi-colour pairwise impact visualisation
+# ======================================================================
+def pairwise_impact_visual(params, key_inputs, swing=0.3, n=9):
+    """
+    For each chosen key input:
+      - Vary it from (1 - swing) to (1 + swing) in 'n' steps
+      - Compute %Δ input vs %Δ outputs [CAPEX, LCOx, NPV, IRR]
+    Plot as a grid:
+      rows   = outputs
+      columns= inputs
+      each cell = scatter of %Δ output vs %Δ input (multi-colour, high dpi)
+    """
+    base = compute_TEA(params)
+    outputs = ["CAPEX", "LCOx", "NPV", "IRR"]
+    base_vals = {k: base[k] for k in outputs}
+    facs = np.linspace(1 - swing, 1 + swing, n)
+
+    n_out = len(outputs)
+    n_in = len(key_inputs)
+
+    colors = [
+        "tab:blue", "tab:orange", "tab:green", "tab:red",
+        "tab:purple", "tab:brown", "tab:pink", "tab:gray",
+        "tab:olive", "tab:cyan"
+    ]
+
+    fig, axes = plt.subplots(
+        n_out, n_in,
+        figsize=(3.0 * n_in + 2, 2.8 * n_out + 2),
+        dpi=200,
+        squeeze=False
+    )
+
+    for j, inp in enumerate(key_inputs):
+        col = colors[j % len(colors)]
+        for i, out_name in enumerate(outputs):
+            ax = axes[i, j]
+            for f in facs:
+                p2 = params.copy()
+                p2[inp] = params[inp] * f
+                res = compute_TEA(p2)
+
+                d_in = (f - 1.0) * 100.0
+                base_out = base_vals[out_name]
+                if base_out != 0:
+                    d_out = (res[out_name] - base_out) / base_out * 100.0
+                else:
+                    d_out = 0.0
+
+                ax.scatter(d_in, d_out, color=col, alpha=0.8, s=30)
+
+            ax.axhline(0.0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
+            ax.axvline(0.0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
+
+            if i == 0:
+                ax.set_title(inp, fontsize=9)
+            if j == 0:
+                ax.set_ylabel(f"%Δ {out_name}", fontsize=9)
+
+            ax.set_xlabel("%Δ input", fontsize=8)
+            ax.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        "Pairwise impact of key cost drivers on TEA outputs (% change vs % change)",
+        fontsize=12
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+
+def interactive_pairwise_visual(params):
+    """
+    Wrapper that asks the user which inputs and what swing, then calls pairwise_impact_visual.
+    """
+    swing_pct = ask_float(
+        "Pairwise sensitivity +/- percent (e.g., 30 for ±30%) [default 30]: ",
+        default=30, min_val=0.0, max_val=300.0
+    )
+    swing = swing_pct / 100.0
+
+    print("\nDefault key inputs for pairwise visualisation:")
+    default_keys = ['C_PE', 'C_RM', 'C_UT', 'COL', 'P_prod', 'tau_CO2', 'E_CO2']
+    print("  " + ", ".join(default_keys))
+
+    use_default = input("Use default input list for pairwise plots? [Y/n]: ").strip().lower()
+    if use_default in ("", "y"):
+        keys = [k for k in default_keys if k in params]
+    else:
+        raw = input("Enter comma-separated parameter names (must be keys in params): ")
+        cand = [x.strip() for x in raw.split(",") if x.strip() in params]
+        if not cand:
+            keys = [k for k in default_keys if k in params]
+        else:
+            keys = cand
+
+    if not keys:
+        print("No valid inputs found for pairwise visualisation; skipping.")
+        return
+
+    pairwise_impact_visual(params, keys, swing=swing, n=9)
+
+
+# ======================================================================
+#  >>> NEW: ESG/compliance sweep (5% -> 75%) with multi-visualisations <<<
+# ======================================================================
+def _roi_metrics_from_out(out):
+    """
+    Compute ROI_total, ROI_avg, EBITDA, EBIT (averages), Payback from a TEA result 'out'.
+    Assumes constant per-year revenue and opex over the horizon.
+    """
+    N = int(len(out["dep_schedule"]) - 1)
+    if N <= 0:
+        return 0.0, 0.0, 0.0, 0.0, None
+
+    years = np.arange(1, N+1)
+    revenue = np.full_like(years, out["R"], dtype=float)
+    opex = np.full_like(years, out["OC"], dtype=float)
+    depreciation = out["dep_schedule"][1:N+1]
+    ebit = out["EBT_schedule"][1:N+1]          # (no explicit interest)
+    tax = out["tax_schedule"][1:N+1]
+    net_income = ebit - tax
+    ebitda = revenue - opex
+
+    CAPEX_tot = out["CAPEX"]
+    total_net_income = float(np.sum(net_income))
+    avg_net_income = float(np.mean(net_income))
+    ROI_total = total_net_income / CAPEX_tot if CAPEX_tot != 0 else 0.0
+    ROI_avg   = avg_net_income   / CAPEX_tot if CAPEX_tot != 0 else 0.0
+    avg_ebitda = float(np.mean(ebitda))
+    avg_ebit   = float(np.mean(ebit))
+    payback = compute_payback(out["CF"])
+
+    return ROI_total, ROI_avg, avg_ebitda, avg_ebit, payback
+
+
+def esg_sweep_metrics(params, f_min=0.05, f_max=0.75, n=15):
+    """
+    Sweep f_esg between [f_min, f_max] (fractions of OPEX) and compute:
+    OPEX, IRR, NPV, Revenue, EBITDA, EBIT, ROI_total, ROI_avg, Payback,
+    and the Required Selling Price to HOLD THE BASE IRR constant.
+    Returns a pandas DataFrame.
+    """
+    p0 = params.copy()
+    base_out = compute_TEA(p0)
+    base_IRR = base_out["IRR"]
+    base_f   = p0.get("f_esg", 0.0)
+
+    f_vals = np.linspace(f_min, f_max, n)
+    rows = []
+
+    for f in f_vals:
+        p = p0.copy()
+        p["f_esg"] = float(f)
+
+        out = compute_TEA(p)
+        ROI_total, ROI_avg, avg_ebitda, avg_ebit, pb = _roi_metrics_from_out(out)
+
+        # required selling price to hold the *base IRR* constant
+        P_req, out_req = price_for_target_irr(p, target_irr=base_IRR)
+        rows.append({
+            "f_esg": f,
+            "OPEX": out["OC"],
+            "IRR": out["IRR"],
+            "NPV": out["NPV"],
+            "Revenue": out["R"],
+            "EBITDA": avg_ebitda,
+            "EBIT": avg_ebit,
+            "ROI_total": ROI_total,
+            "ROI_avg": ROI_avg,
+            "Payback": pb if pb is not None else np.nan,
+            "P_req_hold_base_IRR": P_req if P_req is not None else np.nan,
+            "ESG_cost": out.get("esg_cost", 0.0),
+            "Base_f_esg": base_f,
+        })
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+def plot_esg_sweep_lines(df, design_label=""):
+    """
+    Simple line plots: metric vs f_esg.
+    """
+    # 1) OPEX
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["OPEX"])
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("OPEX (USD/yr)")
+    plt.title(f"OPEX vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 2) NPV
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["NPV"])
+    plt.axhline(0.0, linestyle="--")
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("NPV (USD)")
+    plt.title(f"NPV vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 3) IRR
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["IRR"]*100.0)
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("IRR (%)")
+    plt.title(f"IRR vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 4) ROI total & avg
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["ROI_total"]*100.0)
+    plt.plot(df["f_esg"]*100, df["ROI_avg"]*100.0)
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("ROI (%)")
+    plt.title(f"ROI (total & avg) vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.legend(["Total ROI", "Avg annual ROI"])
+    plt.tight_layout()
+    plt.show()
+
+    # 5) Revenue / EBITDA / EBIT
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["Revenue"])
+    plt.plot(df["f_esg"]*100, df["EBITDA"])
+    plt.plot(df["f_esg"]*100, df["EBIT"])
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("USD/year")
+    plt.title(f"Revenue / EBITDA / EBIT vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.legend(["Revenue", "EBITDA", "EBIT"])
+    plt.tight_layout()
+    plt.show()
+
+    # 6) Payback
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["Payback"])
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("Payback (years)")
+    plt.title(f"Payback vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 7) Required selling price to keep base IRR
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.plot(df["f_esg"]*100, df["P_req_hold_base_IRR"])
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("Required selling price (USD/ton)")
+    plt.title(f"Price to HOLD base IRR vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def esg_critical_scatter(df, outputs=None, design_label=""):
+    """
+    Critical multi-colour visualisation: %Δ(output) vs %Δ f_esg.
+    """
+    if outputs is None:
+        outputs = ["OPEX", "IRR", "NPV", "Revenue", "EBITDA", "EBIT", "ROI_total", "ROI_avg", "Payback"]
+
+    f0 = float(df["Base_f_esg"].iloc[0])
+    idx0 = (df["f_esg"] - f0).abs().argmin()
+    base_vals = {name: float(df.loc[idx0, name]) for name in outputs if name in df.columns}
+
+    x = (df["f_esg"] - f0) / (f0 if abs(f0) > 1e-12 else 1.0) * 100.0
+
+    chunk = 4
+    for start in range(0, len(outputs), chunk):
+        outs = outputs[start:start+chunk]
+        n_rows = len(outs)
+        fig, axes = plt.subplots(n_rows, 1, figsize=(7.5, 2.6*n_rows+1), dpi=200, squeeze=False)
+        for i, out_name in enumerate(outs):
+            ax = axes[i, 0]
+            if out_name not in df.columns:
+                continue
+            y = df[out_name].astype(float)
+            y0 = base_vals.get(out_name, y.iloc[0])
+            y_rel = ((y - y0) / (abs(y0) if abs(y0) > 1e-12 else 1.0)) * 100.0
+            ax.scatter(x, y_rel, s=30, alpha=0.9)
+            ax.axhline(0.0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
+            ax.axvline(0.0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel("%Δ ESG/compliance fraction (vs base)")
+            ax.set_ylabel(f"%Δ {out_name}")
+            if i == 0:
+                ax.set_title(f"Critical %Δ plots vs %Δ f_esg{(' – ' + design_label) if design_label else ''}")
         plt.tight_layout()
         plt.show()
 
-def plot_all_pillars_small_multiples(scores_by_tech: Dict[str, Dict[str, float]], pillars: Dict[str, List[str]]) -> None:
-    techs = list(scores_by_tech.keys())
-    if not pillars:
-        return
-    r = math.ceil(len(pillars) / 3)
-    c = 3
-    fig, axes = plt.subplots(r, c, figsize=(18, 3 * r), sharey=True)
-    axes = np.array(axes).reshape(-1)
-    for i, (pillar, subs) in enumerate(pillars.items()):
-        ax = axes[i]
-        x = np.arange(len(subs))
-        width = 0.8 / max(len(techs), 1)
-        for idx, tech in enumerate(techs):
-            vals = [scores_by_tech[tech].get(f"{pillar}:{sub}", 0.0) for sub in subs]
-            y = _norm0_10(vals)
-            ax.bar(x + (idx - (len(techs) - 1) / 2) * width, y, width=width, label=tech if i == 0 else None)
-        ax.set_title(pillar)
-        ax.set_xticks(x)
-        ax.set_xticklabels(subs, rotation=0)
-        ax.grid(True, axis="y", linestyle="--", linewidth=0.5)
-        if i % 3 == 0:
-            ax.set_ylabel("0–10")
-    for j in range(i + 1, len(axes)):
-        axes[j].axis("off")
-    handles, labels = axes[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="lower center", ncol=min(len(techs), 5))
-    fig.suptitle("Key Issue Comparison per Pillar (0–10 normalized)")
-    fig.tight_layout(rect=[0, 0.06, 1, 0.96])
-    plt.show()
 
-def plot_pillar_heatmaps(pillar_avgs: pd.DataFrame) -> None:
-    if pillar_avgs.empty:
-        return
-    data = pillar_avgs.copy()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    im = ax.imshow(data.values, aspect="auto")
-    ax.set_xticks(range(data.shape[1]))
-    ax.set_xticklabels(data.columns, rotation=45, ha="right")
-    ax.set_yticks(range(data.shape[0]))
-    ax.set_yticklabels(data.index)
-    for i in range(data.shape[0]):
-        for j in range(data.shape[1]):
-            ax.text(j, i, f"{data.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
-    ax.set_title("Pillar Averages – Raw")
-    fig.colorbar(im, ax=ax, shrink=0.8, label="Score")
-    fig.tight_layout()
-    plt.show()
+def run_esg_sweep_and_plots(params, design_label="", f_min=0.05, f_max=0.75, n=15):
+    """
+    Generates the sweep, prints a compact preview, and renders all visuals.
+    """
+    df = esg_sweep_metrics(params, f_min=f_min, f_max=f_max, n=n)
 
-def plot_radar_profiles(pillar_avgs: pd.DataFrame) -> None:
-    if pillar_avgs.empty:
-        return
-    pillars = pillar_avgs.index.tolist()
-    techs = pillar_avgs.columns.tolist()
-    norm = (pillar_avgs / WEIGHTED_THEORETICAL_MAX) * OUTPUT_SCALE
-    ax, angles = _radar_axes(len(pillars))
-    for tech in techs:
-        vals = norm[tech].tolist()
-        vals += vals[:1]
-        ax.plot(angles, vals, linewidth=2, alpha=0.9, label=tech)
-        ax.fill(angles, vals, alpha=0.1)
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(pillars)
-    ax.set_yticklabels([])
-    ax.set_ylim(0, 10)
-    ax.set_title("Pillar Profiles (Radar, 0–10)")
-    ax.legend(loc="upper right", bbox_to_anchor=(1.25, 1.1), frameon=False)
-    plt.show()
+    # preview
+    with pd.option_context('display.max_columns', None):
+        print("\nESG/compliance sweep (head):")
+        print(df.head().to_string(index=False, float_format=lambda x: f"{x:,.4g}"))
+        print("\n... (tail):")
+        print(df.tail().to_string(index=False, float_format=lambda x: f"{x:,.4g}"))
 
-def plot_parallel_coordinates(pillar_avgs: pd.DataFrame) -> None:
-    if pillar_avgs.empty:
-        return
-    data = pillar_avgs.copy()
-    lo = data.min(axis=1)
-    hi = data.max(axis=1)
-    denom = (hi - lo).replace(0, 1.0)
-    norm = data.sub(lo, axis=0).div(denom, axis=0)
-    x = np.arange(len(data.index))
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for tech in norm.columns:
-        ax.plot(x, norm[tech].values, marker="o", linewidth=2, alpha=0.9, label=tech)
-    ax.set_xticks(x)
-    ax.set_xticklabels(data.index)
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Normalized (0–1)")
-    ax.set_title("Parallel Coordinates – Pillar Profiles")
-    ax.legend(loc="upper right", ncol=2, frameon=False)
-    plt.show()
+    # Lines
+    plot_esg_sweep_lines(df, design_label=design_label)
 
-def plot_tradeoff_scatter(pillar_avgs: pd.DataFrame) -> None:
-    if pillar_avgs.empty:
-        return
-    pairs = [
-        ("Financial", "Environmental"),
-        ("Governance", "Process"),
-        ("Financial", "Social"),
-    ]
-    for xlab, ylab in pairs:
-        if xlab not in pillar_avgs.index or ylab not in pillar_avgs.index:
-            continue
-        x = pillar_avgs.loc[xlab, :]
-        y = pillar_avgs.loc[ylab, :]
-        fig, ax = plt.subplots(figsize=(8, 6))
-        ax.scatter(x, y, s=120, alpha=0.85, edgecolor="black", linewidth=0.7)
-        for tech in pillar_avgs.columns:
-            ax.annotate(tech, (x[tech], y[tech]), xytext=(6, 6), textcoords="offset points")
-        ax.set_xlabel(f"{xlab} (pillar mean)")
-        ax.set_ylabel(f"{ylab} (pillar mean)")
-        ax.set_title(f"{ylab} vs {xlab} – Trade-off View")
-        plt.show()
+    # Critical scatter
+    esg_critical_scatter(df, design_label=design_label)
 
-# ----------------------- MCDA utilities & Methods -------------------
-def _weights_vector(pillars: Sequence[str], weights_pct: Dict[str, float]) -> np.ndarray:
-    w = np.array([float(weights_pct.get(p, 0.0)) for p in pillars], dtype=float)
-    s = w.sum()
-    return w / (s if s != 0 else 1.0)
-
-def _decision_matrix(pillar_avgs: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[str]]:
-    alts = list(pillar_avgs.columns)
-    crits = list(pillar_avgs.index)
-    A = pillar_avgs.to_numpy().T  # (m_alts, n_criteria)
-    return A, alts, crits
-
-def method_weighted(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float]) -> pd.Series:
-    A, alts, crits = _decision_matrix(pillar_avgs)
-    w = _weights_vector(crits, weights_pct)
-    s = A @ w
-    return pd.Series(s, index=alts).sort_values(ascending=False)
-
-def method_wpm(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float]) -> pd.Series:
-    A, alts, crits = _decision_matrix(pillar_avgs)
-    w = _weights_vector(crits, weights_pct)
-    col_max = A.max(axis=0)
-    col_max[col_max == 0.0] = 1.0
-    N = A / col_max
-    N[N <= 0.0] = 1e-12
-    log_scores = (np.log(N) * w).sum(axis=1)
-    scores = np.exp(log_scores)
-    return pd.Series(scores, index=alts).sort_values(ascending=False)
-
-def method_rank(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float]) -> pd.Series:
-    alts = list(pillar_avgs.columns)
-    crits = list(pillar_avgs.index)
-    w = _weights_vector(crits, weights_pct)
-    m = len(alts)
-    points = np.zeros(m)
-    for j, _ in enumerate(crits):
-        ranks = pillar_avgs.iloc[j, :].rank(ascending=False, method="average")
-        pts = (m - ranks + 1.0).to_numpy()
-        points += w[j] * pts
-    return pd.Series(points, index=alts).sort_values(ascending=False)
-
-def method_topsis(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float]) -> pd.Series:
-    A, alts, crits = _decision_matrix(pillar_avgs)
-    w = _weights_vector(crits, weights_pct)
-    norm = np.linalg.norm(A, axis=0)
-    norm[norm == 0.0] = 1.0
-    R = A / norm
-    V = R * w
-    ideal_best = V.max(axis=0)
-    ideal_worst = V.min(axis=0)
-    d_best = np.linalg.norm(V - ideal_best, axis=1)
-    d_worst = np.linalg.norm(V - ideal_worst, axis=1)
-    score = d_worst / (d_best + d_worst + 1e-12)
-    return pd.Series(score, index=alts).sort_values(ascending=False)
-
-def method_vikor(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float], v: float = 0.5) -> pd.Series:
-    A, alts, crits = _decision_matrix(pillar_avgs)
-    w = _weights_vector(crits, weights_pct)
-    f_star = A.max(axis=0)
-    f_minus = A.min(axis=0)
-    denom = f_star - f_minus
-    denom[denom == 0.0] = 1.0
-    gap = (f_star - A) / denom
-    S = (gap * w).sum(axis=1)
-    R = (gap * w).max(axis=1)
-    S_star, S_minus = S.min(), S.max()
-    R_star, R_minus = R.min(), R.max()
-    QS = (S - S_star) / (S_minus - S_star + 1e-12)
-    QR = (R - R_star) / (R_minus - R_star + 1e-12)
-    Q = v * QS + (1 - v) * QR
-    score = 1.0 - Q
-    return pd.Series(score, index=alts).sort_values(ascending=False)
-
-def method_edas(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float]) -> pd.Series:
-    A, alts, crits = _decision_matrix(pillar_avgs)
-    w = _weights_vector(crits, weights_pct)
-    avg = A.mean(axis=0)
-    avg[avg == 0.0] = 1.0
-    PDA = np.maximum(0.0, (A - avg) / avg)
-    NDA = np.maximum(0.0, (avg - A) / avg)
-    SP = PDA @ w
-    SN = NDA @ w
-    NSP = SP / (SP.max() + 1e-12)
-    NSN = SN / (SN.max() + 1e-12)
-    AS = (NSP + (1.0 - NSN)) / 2.0
-    return pd.Series(AS, index=alts).sort_values(ascending=False)
-
-def method_maut(pillar_avgs: pd.DataFrame, weights_pct: Dict[str, float]) -> pd.Series:
-    A, alts, crits = _decision_matrix(pillar_avgs)
-    w = _weights_vector(crits, weights_pct)
-    lo = A.min(axis=0)
-    hi = A.max(axis=0)
-    denom = hi - lo
-    denom[denom == 0.0] = 1.0
-    U = (A - lo) / denom
-    score = U @ w
-    return pd.Series(score, index=alts).sort_values(ascending=False)
-
-def method_pca(pillar_avgs: pd.DataFrame) -> pd.Series:
-    A, alts, _ = _decision_matrix(pillar_avgs)
-    if A.shape[0] < 2 or A.shape[1] < 1:
-        return pd.Series(np.ones(A.shape[0]), index=alts)
-    X = A - A.mean(axis=0)
-    std = A.std(axis=0, ddof=1)
-    std[std == 0.0] = 1.0
-    X = X / std
-    U, S, Vt = np.linalg.svd(X, full_matrices=False)
-    pc1_scores = U[:, 0] * S[0]
-    mean_profile = X.mean(axis=1)
-    if np.corrcoef(pc1_scores, mean_profile)[0, 1] < 0:
-        pc1_scores = -pc1_scores
-    lo, hi = pc1_scores.min(), pc1_scores.max()
-    if hi - lo <= 1e-12:
-        scaled = np.full_like(pc1_scores, 0.5)
-    else:
-        scaled = (pc1_scores - lo) / (hi - lo)
-    return pd.Series(scaled, index=alts).sort_values(ascending=False)
-
-# ----------------------- Normalization (0–10 display) ----
-def _scale_series_by_method(s: pd.Series, method: str) -> pd.Series:
-    if s.empty:
-        return s
-    m = method.upper()
-    if m == "WEIGHTED":
-        base = WEIGHTED_THEORETICAL_MAX
-        return ((s / base) * OUTPUT_SCALE).clip(lower=MIN_DISPLAY_SCORE)
-    if m in {"TOPSIS", "VIKOR", "EDAS", "MAUT", "PCA"}:
-        return (s * OUTPUT_SCALE).clip(lower=MIN_DISPLAY_SCORE)
-    if m == "RANK":
-        lo, hi = float(s.min()), float(s.max())
-        if math.isclose(hi, lo):
-            return pd.Series([OUTPUT_SCALE / 2.0] * len(s), index=s.index)
-        return (((s - lo) / (hi - lo)) * OUTPUT_SCALE).clip(lower=MIN_DISPLAY_SCORE)
-    if m == "WPM":
-        return (s * OUTPUT_SCALE).clip(lower=MIN_DISPLAY_SCORE)
-    lo, hi = float(s.min()), float(s.max())
-    if math.isclose(hi, lo):
-        return pd.Series([OUTPUT_SCALE / 2.0] * len(s), index=s.index)
-    return (((s - lo) / (hi - lo)) * OUTPUT_SCALE).clip(lower=MIN_DISPLAY_SCORE)
-
-# ----------------------- DEA & Monte-Carlo ----------------
-def _dirichlet(alpha: np.ndarray) -> np.ndarray:
-    samples = np.random.gamma(shape=alpha, scale=1.0)
-    s = samples.sum()
-    if s <= 0:
-        return np.ones_like(alpha) / len(alpha)
-    return samples / s
-
-def compute_dominance_matrix(pillar_avgs: pd.DataFrame) -> pd.DataFrame:
-    alts = list(pillar_avgs.columns)
-    A = pillar_avgs.to_numpy().T
-    m = len(alts)
-    dom = np.zeros((m, m), dtype=int)
-    for i in range(m):
-        for j in range(m):
-            if i == j:
-                continue
-            ge_all = np.all(A[i, :] >= A[j, :])
-            gt_any = np.any(A[i, :] > A[j, :])
-            dom[i, j] = int(ge_all and gt_any)
-    return pd.DataFrame(dom, index=alts, columns=alts)
-
-def approx_dea_diagnostics(
-    pillar_avgs: pd.DataFrame,
-    samples: int = 5000,
-    seed: Optional[int] = None,
-    min_peer_lambda: float = 0.05,
-    eps: float = 1e-9,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if seed is not None:
-        np.random.seed(seed)
-        random.seed(seed)
-    alts = list(pillar_avgs.columns)
-    pillars = list(pillar_avgs.index)
-    Y = pillar_avgs.to_numpy().T
-    m, n = Y.shape
-    frontier_hits = np.zeros(m, dtype=int)
-    rmax = np.ones(m, dtype=float)
-    best_lambda_store = [None] * m
-    bottleneck_counts = np.zeros((n, m), dtype=int)
-    for i in range(m):
-        others = [k for k in range(m) if k != i]
-        if not others:
-            continue
-        Y_others = Y[others, :]
-        best_r = 1.0
-        best_lamb = None
-        for _ in range(samples):
-            lamb = _dirichlet(np.ones(len(others)))
-            mix = lamb @ Y_others
-            denom = np.maximum(Y[i, :], eps)
-            ratios = mix / denom
-            r = float(np.min(ratios))
-            bottleneck_idx = int(np.argmin(ratios))
-            bottleneck_counts[bottleneck_idx, i] += 1
-            if r >= 1.0:
-                frontier_hits[i] += 1
-                if r > best_r:
-                    best_r = r
-                    best_lamb = lamb
-        rmax[i] = max(best_r, 1.0)
-        best_lambda_store[i] = best_lamb
-    phi_hat = rmax
-    eff_out = 1.0 / phi_hat
-    frontier_prob = frontier_hits / float(samples)
-    top_b_idx = bottleneck_counts.argmax(axis=0)
-    top_b_share = bottleneck_counts.max(axis=0) / np.maximum(bottleneck_counts.sum(axis=0), 1)
-    dea_summary = pd.DataFrame({
-        "Tech": alts,
-        "FrontierProb": frontier_prob,
-        "PhiHat": phi_hat,
-        "EffOut": eff_out,
-        "Bottleneck": [pillars[idx] for idx in top_b_idx],
-        "BottleneckShare": top_b_share,
-    }).set_index("Tech")
-    peer = np.zeros((m, m), dtype=float)
-    for i in range(m):
-        others = [k for k in range(m) if k != i]
-        lamb = best_lambda_store[i]
-        if lamb is None:
-            continue
-        for w, k in zip(lamb, others):
-            if w >= min_peer_lambda:
-                peer[i, k] = w
-    peer_matrix = pd.DataFrame(peer, index=alts, columns=alts)
-    bmat = bottleneck_counts / np.maximum(bottleneck_counts.sum(axis=0, keepdims=True), 1)
-    bottleneck_matrix = pd.DataFrame(bmat, index=pillars, columns=alts)
-    targets = pillar_avgs.copy()
-    for idx, tech in enumerate(alts):
-        targets[tech] = pillar_avgs[tech] * phi_hat[idx]
-    return dea_summary, peer_matrix, bottleneck_matrix, targets
-
-def run_monte_carlo_sensitivity(
-    pillar_avgs: pd.DataFrame,
-    weights_pct: Dict[str, float],
-    methods: Sequence[str],
-    sims: int = 2000,
-    weight_alpha: float = 1.0,
-    score_noise_sigma: float = 0.03,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.DataFrame]]:
-    methods = [m.upper() for m in methods]
-    if "WEIGHTED" not in methods:
-        methods = ["WEIGHTED"] + methods
-    alts = pillar_avgs.columns.tolist()
-    pillars = pillar_avgs.index.tolist()
-    m = len(alts)
-    best_counts: Dict[str, Dict[str, int]] = {meth: {a: 0 for a in alts} for meth in methods}
-    rank_sum: Dict[str, np.ndarray] = {meth: np.zeros(m, dtype=float) for meth in methods}
-    rank_sqsum: Dict[str, np.ndarray] = {meth: np.zeros(m, dtype=float) for meth in methods}
-    rank_counts: Dict[str, np.ndarray] = {meth: np.zeros((m, m), dtype=int) for meth in methods}
-    A0 = pillar_avgs.to_numpy().T
-    alpha_vec = np.full(len(pillars), float(weight_alpha))
-    for _ in range(sims):
-        w = _dirichlet(alpha_vec)
-        noise = np.random.normal(0.0, score_noise_sigma, size=A0.shape)
-        A = np.clip(A0 + noise, a_min=0.0, a_max=None)
-        dfA = pd.DataFrame(A.T, index=pillars, columns=alts)
-        per_method: Dict[str, pd.Series] = {}
-        per_method["WEIGHTED"] = method_weighted(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "WPM" in methods:
-            per_method["WPM"] = method_wpm(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "RANK" in methods:
-            per_method["RANK"] = method_rank(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "TOPSIS" in methods:
-            per_method["TOPSIS"] = method_topsis(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "VIKOR" in methods:
-            per_method["VIKOR"] = method_vikor(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "EDAS" in methods:
-            per_method["EDAS"] = method_edas(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "MAUT" in methods:
-            per_method["MAUT"] = method_maut(dfA, {p: w[i]*100 for i,p in enumerate(pillars)})
-        if "PCA" in methods:
-            per_method["PCA"] = method_pca(dfA)
-        for meth, s in per_method.items():
-            s_sorted = s.sort_values(ascending=False)
-            winner = s_sorted.index[0]
-            best_counts[meth][winner] += 1
-            ranks = s.rank(ascending=False, method="average")
-            rank_vals = ranks.loc[alts].to_numpy(dtype=float)
-            for i_alt, rk in enumerate(rank_vals.astype(int)):
-                rank_counts[meth][i_alt, rk-1] += 1
-            rank_sum[meth] += rank_vals
-            rank_sqsum[meth] += rank_vals ** 2
-    pbest_rows = []
-    for meth, d in best_counts.items():
-        for a in alts:
-            pbest_rows.append({"Method": meth, "Tech": a, "P(Best)": d[a] / float(sims)})
-    Pbest = pd.DataFrame(pbest_rows).pivot(index="Tech", columns="Method", values="P(Best)").fillna(0.0)
-    mean_rows = []
-    std_rows = []
-    RankDist: Dict[str, pd.DataFrame] = {}
-    for meth in methods:
-        mu = rank_sum[meth] / float(sims)
-        var = (rank_sqsum[meth] / float(sims)) - (mu ** 2)
-        var = np.maximum(var, 0.0)
-        sd = np.sqrt(var)
-        for i, a in enumerate(alts):
-            mean_rows.append({"Method": meth, "Tech": a, "MeanRank": mu[i]})
-            std_rows.append({"Method": meth, "Tech": a, "StdRank": sd[i]})
-        rd = (rank_counts[meth] / float(sims))
-        RankDist[meth] = pd.DataFrame(rd, index=alts, columns=[f"rank_{k}" for k in range(1, m+1)])
-    MeanRank = pd.DataFrame(mean_rows).pivot(index="Tech", columns="Method", values="MeanRank")
-    StdRank = pd.DataFrame(std_rows).pivot(index="Tech", columns="Method", values="StdRank")
-    return Pbest, MeanRank, StdRank, RankDist
-
-# ----------------------- Validation visuals ----------------
-def plot_pbest(series: pd.Series, title: str) -> None:
-    fig, ax = plt.subplots(figsize=(9, 5))
-    series.sort_values(ascending=False).plot(kind="bar", ax=ax, title=title)
-    ax.set_ylabel("Probability")
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.5)
+    # ESG share of OPEX evolution
+    plt.figure(figsize=(8, 4), dpi=200)
+    share = df["ESG_cost"] / df["OPEX"]
+    plt.plot(df["f_esg"]*100.0, share*100.0)
+    plt.xlabel("ESG/compliance fraction of base OPEX (%)")
+    plt.ylabel("ESG share of total OPEX (%)")
+    plt.title(f"ESG share of OPEX vs ESG/compliance fraction{(' – ' + design_label) if design_label else ''}")
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.show()
 
-# ----------------------- PDF report builder ----------------
-def build_pdf_report(title: str, sections: List[Dict[str, Any]]) -> bytes:
-    buf = io.BytesIO()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
-    styles = getSampleStyleSheet()
-    story = []
-    style_h = styles["Heading1"]
-    style_h.alignment = 1
-    story.append(Paragraph(title, style_h))
-    story.append(Spacer(1, 6))
-    story.append(Paragraph(f"Generated: {now}", styles["Normal"]))
-    story.append(Spacer(1, 12))
-    for sec in sections:
-        story.append(Paragraph(sec.get("heading", ""), styles["Heading2"]))
-        if sec.get("text"):
-            story.append(Paragraph(sec["text"], styles["Normal"]))
-            story.append(Spacer(1, 6))
-        for tbl, caption in sec.get("tables", []):
-            if tbl is None or tbl.empty:
-                continue
-            story.append(Paragraph(caption or "Table", styles["Italic"]))
-            df = tbl.copy()
-            df = df.round(6)
-            header = list(df.reset_index().columns)
-            data = [header] + df.reset_index().values.tolist()
-            tbl_style = RLTable(data, hAlign="LEFT")
-            tbl_style.setStyle(TableStyle([
-                ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
-                ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
-                ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ]))
-            story.append(tbl_style)
-            story.append(Spacer(1, 8))
-        for img_bytes, caption in sec.get("images", []):
-            try:
-                rl_img = pil_bytes_to_rlimage(img_bytes)
-                story.append(rl_img)
-                if caption:
-                    story.append(Paragraph(caption, styles["Italic"]))
-                story.append(Spacer(1, 8))
-            except Exception as e:
-                story.append(Paragraph(f"[Image error: {e}]", styles["Normal"]))
-        story.append(PageBreak())
-    doc.build(story)
-    buf.seek(0)
-    return buf.getvalue()
 
-# ----------------------- Streamlit UI ---------------------
-apply_pro_style()
-st.set_page_config(page_title="Risk Assessment Toolkit", layout="wide")
-st.title("Risk Assessment Toolkit")
-st.markdown("Use tabs to manage Risks, ESGFP scoring, Scenarios, Validation and Compliance TEA.")
+# ======================================================================
+#  Scenario cost–benefit analysis (Optimistic / Moderate / Pessimistic)
+# ======================================================================
+def scenario_cba(params, design_label):
+    """
+    Build 3 scenarios (Optimistic / Moderate / Pessimistic) around the base case
+    and compute TEA + cost–benefit metrics, then visualise.
 
-# Session state initialization
-if "risks" not in st.session_state:
-    st.session_state.risks = []
-if "scores_by_tech" not in st.session_state:
-    st.session_state.scores_by_tech = {}
-if "pillars" not in st.session_state:
-    st.session_state.pillars = dict(DEFAULT_ESGFP)
-if "pillar_avgs_df" not in st.session_state:
-    st.session_state.pillar_avgs_df = pd.DataFrame()
-if "last_weights" not in st.session_state:
-    st.session_state.last_weights = None
-if "last_methods" not in st.session_state:
-    st.session_state.last_methods = None
-if "scenario_results" not in st.session_state:
-    st.session_state.scenario_results = {}
+    Includes ESG/compliance swings (f_esg) and reports impact on average net profit.
+    """
+    base = compute_TEA(params)
 
-# Sidebar quick actions
-st.sidebar.header("Quick Actions")
-if st.sidebar.button("Load example dataset"):
-    pillars = dict(DEFAULT_ESGFP)
-    techs = {
-        "Process Design A": {f"{p}:{sub}": round(5.0 * (1.0 + 0.25*(i%3)), 3) for i, (p, subs) in enumerate(pillars.items()) for sub in subs},
-        "Process Design B": {f"{p}:{sub}": round(6.5 * (1.0 + 0.1*(i%2)), 3) for i, (p, subs) in enumerate(pillars.items()) for sub in subs},
+    print("\n--- Scenario cost–benefit analysis for", design_label, "---")
+    use_def = input("Use default percentage swings for scenarios? [Y/n]: ").strip().lower()
+
+    if use_def in ("", "y"):
+        price_swing_pct = 20.0   # ±20% on selling price
+        cost_swing_pct  = 20.0   # ±20% on C_RM, C_UT
+        capex_swing_pct = 15.0   # ±15% on C_PE
+        emis_swing_pct  = 20.0   # ±20% on E_CO2
+        risk_swing_pct  = 50.0   # ±50% on f_risk_op and delta_risk
+        esg_swing_pct   = 30.0   # ±30% on f_esg
+    else:
+        price_swing_pct = ask_float("Selling price swing ±(%) [default 20]: ", default=20, min_val=0)
+        cost_swing_pct  = ask_float("Operating cost swing ±(%) [default 20]: ", default=20, min_val=0)
+        capex_swing_pct = ask_float("CAPEX swing ±(%) [default 15]: ", default=15, min_val=0)
+        emis_swing_pct  = ask_float("CO₂ emissions swing ±(%) [default 20]: ", default=20, min_val=0)
+        risk_swing_pct  = ask_float("Risk premium swing ±(%) [default 50]: ", default=50, min_val=0)
+        esg_swing_pct   = ask_float("ESG/compliance OPEX swing ±(%) [default 30]: ", default=30, min_val=0)
+
+    ps = price_swing_pct / 100.0
+    cs = cost_swing_pct  / 100.0
+    xs = capex_swing_pct / 100.0
+    es = emis_swing_pct  / 100.0
+    rs = risk_swing_pct  / 100.0
+    esg = esg_swing_pct  / 100.0
+
+    def apply_mult(base_p, mults):
+        p = base_p.copy()
+        for k, fac in mults.items():
+            if k in p:
+                p[k] = p[k] * fac
+        return p
+
+    scenarios = {}
+
+    # Base
+    scenarios["Base"] = (params.copy(), base)
+
+    # Optimistic
+    mult_opt = {
+        "P_prod": 1 + ps,
+        "C_RM":   1 - cs,
+        "C_UT":   1 - cs,
+        "C_PE":   1 - xs,
+        "E_CO2":  1 - es,
+        "f_risk_op": 1 - rs,
+        "delta_risk": 1 - rs,
+        "f_esg":  1 - esg,
     }
-    st.session_state.pillars = pillars
-    st.session_state.scores_by_tech = techs
-    st.success("Example dataset loaded.")
+    p_opt = apply_mult(params, mult_opt)
+    scenarios["Optimistic"] = (p_opt, compute_TEA(p_opt))
 
-def make_example_csv_bytes(pillars: Dict[str, List[str]]) -> bytes:
-    cols = []
-    for p, subs in pillars.items():
-        for sub in subs:
-            cols.append(f"{p}:{sub}")
-    df = pd.DataFrame(columns=["Tech"] + cols)
-    df.loc[0] = ["Tech A"] + [5.0 for _ in cols]
-    df.loc[1] = ["Tech B"] + [6.0 for _ in cols]
-    b = io.BytesIO()
-    df.to_csv(b, index=False)
-    return b.getvalue()
+    # Moderate
+    mult_mod = {
+        "P_prod": 1 + 0.5*ps,
+        "C_RM":   1 - 0.5*cs,
+        "C_UT":   1 - 0.5*cs,
+        "C_PE":   1 - 0.5*xs,
+        "E_CO2":  1 - 0.5*es,
+        "f_risk_op": 1 - 0.5*rs,
+        "delta_risk": 1 - 0.5*rs,
+        "f_esg":  1 - 0.5*esg,
+    }
+    p_mod = apply_mult(params, mult_mod)
+    scenarios["Moderate"] = (p_mod, compute_TEA(p_mod))
 
-st.sidebar.download_button("Download example CSV", make_example_csv_bytes(st.session_state.pillars), file_name="esgfp_example_template.csv", mime="text/csv")
-st.sidebar.markdown("---")
-st.sidebar.write("Dependencies: streamlit, pandas, numpy, matplotlib, plotly, reportlab, pillow")
+    # Pessimistic
+    mult_pess = {
+        "P_prod": 1 - ps,
+        "C_RM":   1 + cs,
+        "C_UT":   1 + cs,
+        "C_PE":   1 + xs,
+        "E_CO2":  1 + es,
+        "f_risk_op": 1 + rs,
+        "delta_risk": 1 + rs,
+        "f_esg":  1 + esg,
+    }
+    p_pess = apply_mult(params, mult_pess)
+    scenarios["Pessimistic"] = (p_pess, compute_TEA(p_pess))
 
-# Tabs
-tabs = st.tabs(["Risk Assessment", "ESGFP Scoring", "Scenario Analysis (MCDA)", "Validation (DEA + Monte Carlo)", "Export Reports", "Compliance / ESG TEA"])
-
-# ----- Tab 0: Risk Assessment -----
-with tabs[0]:
-    st.header("Risk Assessment")
-    col_l, col_r = st.columns([2, 1])
-    with col_l:
-        st.subheader("Add / Edit Risks")
-        with st.form("risk_form", clear_on_submit=True):
-            rname = st.text_input("Risk name", "New Risk")
-            prob = st.number_input("Probability (0 < p ≤ 1)", min_value=0.0001, max_value=1.0, value=0.1, format="%.4f")
-            sev = st.number_input("Severity (1–10)", min_value=1.0, max_value=10.0, value=5.0, format="%.2f")
-            add = st.form_submit_button("Add risk")
-            if add:
-                st.session_state.risks.append({"name": rname, "prob": float(prob), "sev": float(sev)})
-                st.success(f"Added risk {rname}.")
-        if st.session_state.risks:
-            df_r = pd.DataFrame([{"Risk": r["name"], "Probability": r["prob"], "Severity": r["sev"], "Rating": r["prob"] * r["sev"]} for r in st.session_state.risks])
-            st.dataframe(df_r.round(4))
-            if st.button("Clear risks"):
-                st.session_state.risks = []
+    # ---- Profit metrics per scenario (average annual net income) ----
+    avg_profit = {}
+    for name, (p_s, res_s) in scenarios.items():
+        N = p_s['N_project']
+        EBT_sched = res_s["EBT_schedule"]
+        tax_sched = res_s["tax_schedule"]
+        if N >= 1:
+            net_income = EBT_sched[1:N+1] - tax_sched[1:N+1]
+            avg_profit[name] = float(np.mean(net_income))
         else:
-            st.info("No risks added yet.")
-    with col_r:
-        st.subheader("Risk Visuals")
-        if st.session_state.risks:
-            risks_objs = [Risk(r["name"], r["prob"], r["sev"]) for r in st.session_state.risks]
-            df_for_plot = risk_dataframe(risks_objs)
-            before = plt.get_fignums()
-            plot_risk_views(df_for_plot)
-            for num in plt.get_fignums():
-                if num not in before:
-                    st.pyplot(plt.figure(num))
-            fig = px.scatter(df_for_plot, x="Probability", y="Severity", size="Rating", hover_name="Risk", title="Risk Bubble – Likelihood × Impact")
-            st.plotly_chart(fig, use_container_width=True)
-            csv_b = io.BytesIO()
-            df_for_plot.to_csv(csv_b, index=False)
-            csv_b.seek(0)
-            st.download_button("Download risk table (CSV)", data=csv_b, file_name="risk_table.csv", mime="text/csv")
+            avg_profit[name] = 0.0
+
+    base_avg_profit = avg_profit.get("Base", list(avg_profit.values())[0])
+
+    # ---- Tabular summary ----
+    rows = []
+    for name, (p_s, res) in scenarios.items():
+        pb = compute_payback(res["CF"])
+        avg_pi = avg_profit[name]
+        if base_avg_profit != 0.0:
+            delta_pi_pct = (avg_pi - base_avg_profit) / abs(base_avg_profit) * 100.0
         else:
-            st.info("Add risks to see visuals.")
+            delta_pi_pct = 0.0
+        rows.append({
+            "Scenario": name,
+            "CAPEX": res["CAPEX"],
+            "LCOx": res["LCOx"],
+            "NPV": res["NPV"],
+            "IRR_%": res["IRR"]*100,
+            "BCR": res["BCR"],
+            "PV_revenue": res["PV_revenue"],
+            "PV_cost_total": res["PV_cost_total"],
+            "Payback": pb,
+            "Avg_Profit": avg_pi,
+            "Delta_Profit_%": delta_pi_pct,
+        })
 
-# ----- Tab 1: ESGFP Scoring -----
-with tabs[1]:
-    st.header("ESGFP Scoring")
-    left, right = st.columns([2, 1])
-    with left:
-        st.subheader("Pillars & Key Issues (session)")
-        for p, subs in st.session_state.pillars.items():
-            st.markdown(f"**{p}** — {', '.join(subs)}")
-        st.write("---")
-        st.subheader("Add Process Design & Scores")
-        with st.expander("Manual add process design"):
-            with st.form("add_tech_form", clear_on_submit=True):
-                tech_name = st.text_input("Process Design name", f"Process Design {len(st.session_state.scores_by_tech)+1}")
-                inputs = {}
-                for p, subs in st.session_state.pillars.items():
-                    st.markdown(f"**{p}**")
-                    for sub in subs:
-                        key = f"{p}:{sub}"
-                        base = st.number_input(f"{p} → {sub} base (1–9)", min_value=1.0, max_value=9.0, value=5.0, key=f"{tech_name}_{key}")
-                        exposure = st.slider(f"Exposure {key}", min_value=0.0, max_value=1.0, value=0.0, key=f"exp_{tech_name}_{key}")
-                        inputs[key] = round(base * (1.0 + exposure), 4)
-                added = st.form_submit_button("Add Process Design")
-                if added:
-                    label = tech_name
-                    k = 2
-                    while label in st.session_state.scores_by_tech:
-                        label = f"{tech_name} ({k})"; k += 1
-                    st.session_state.scores_by_tech[label] = inputs
-                    st.success(f"Added {label}.")
-        st.write("---")
-        st.subheader("Upload ESGFP scores (CSV)")
-        uploaded = st.file_uploader("Upload ESGFP CSV", type=["csv"], key="esg_upload")
-        if uploaded:
-            try:
-                df_up = pd.read_csv(uploaded)
-                if "Tech" not in df_up.columns and df_up.shape[1] >= 1:
-                    df_up.columns.values[0] = "Tech"
-                df_up = df_up.set_index("Tech")
-                for col in df_up.columns:
-                    if ":" in col:
-                        p, sub = col.split(":", 1)
-                        if p not in st.session_state.pillars:
-                            st.session_state.pillars[p] = []
-                        if sub not in st.session_state.pillars[p]:
-                            st.session_state.pillars[p].append(sub)
-                for tech, row in df_up.iterrows():
-                    st.session_state.scores_by_tech[str(tech)] = row.dropna().to_dict()
-                st.success("Uploaded and stored scores.")
-            except Exception as e:
-                st.error(f"CSV read error: {e}")
-        st.write("---")
-        st.subheader("Existing process designs")
-        if st.session_state.scores_by_tech:
-            st.dataframe(pd.DataFrame(st.session_state.scores_by_tech).round(4))
-            if st.button("Clear process designs"):
-                st.session_state.scores_by_tech = {}
-        else:
-            st.info("No process designs in session.")
+    df = pd.DataFrame(rows)
+    print("\nScenario TEA + Cost–Benefit summary (incl. Avg Profit and ΔProfit%):")
+    with pd.option_context('display.max_columns', None):
+        print(df.to_string(index=False,
+                           float_format=lambda x: f"{x:,.3g}"))
 
-    with right:
-        st.subheader("Visualize & Compute Pillar Averages")
-        if not st.session_state.scores_by_tech:
-            st.info("Add process designs first.")
-        else:
-            pillar_avgs = pillar_averages_multi(st.session_state.scores_by_tech, st.session_state.pillars)
-            st.session_state.pillar_avgs_df = pillar_avgs.copy()
-            st.write("Pillar Averages (raw):")
-            st.dataframe(pillar_avgs.round(4))
-            before = plt.get_fignums()
-            plot_pillar_heatmaps(pillar_avgs)
-            for num in plt.get_fignums():
-                if num not in before:
-                    st.pyplot(plt.figure(num))
-            before = plt.get_fignums()
-            plot_radar_profiles(pillar_avgs)
-            for num in plt.get_fignums():
-                if num not in before:
-                    st.pyplot(plt.figure(num))
-            before = plt.get_fignums()
-            plot_parallel_coordinates(pillar_avgs)
-            for num in plt.get_fignums():
-                if num not in before:
-                    st.pyplot(plt.figure(num))
-            try:
-                df_wide = pillar_avgs.T
-                fig_par = px.parallel_coordinates(df_wide.reset_index(), labels={c: c for c in df_wide.columns}, title="Parallel Coordinates (Pillar Profiles)")
-                st.plotly_chart(fig_par, use_container_width=True)
-            except Exception:
-                pass
-            csv_b = io.BytesIO()
-            pillar_avgs.to_csv(csv_b)
-            csv_b.seek(0)
-            st.download_button("Download pillar averages (CSV)", data=csv_b, file_name="pillar_averages.csv", mime="text/csv")
+    # ---- Visualisations for scenarios (multi-colour) ----
+    order = ["Pessimistic", "Moderate", "Base", "Optimistic"]
+    order = [o for o in order if o in scenarios.keys()]
 
-# ----- Tab 2, 3, 4 handled in next chunk -----
+    caps = [scenarios[n][1]["CAPEX"] for n in order]
+    lcoxs = [scenarios[n][1]["LCOx"] for n in order]
+    npvs = [scenarios[n][1]["NPV"] for n in order]
+    irrs = [scenarios[n][1]["IRR"]*100 for n in order]
+    bcrs = [scenarios[n][1]["BCR"] for n in order]
+    avg_pi_plot = [avg_profit[n] for n in order]
 
-# ----------------------- Tab 2: Scenario Analysis (MCDA) ----------------
-with tabs[2]:
-    st.header("Scenario Analysis (MCDA)")
-    if st.session_state.pillar_avgs_df.empty:
-        st.info("Create pillar averages in ESGFP tab first.")
+    idx = np.arange(len(order))
+    colors = ["tab:red", "tab:orange", "tab:blue", "tab:green"]
+
+    # NPV per scenario
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, npvs, color=[colors[i % len(colors)] for i in range(len(idx))])
+    plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+    plt.xticks(idx, order)
+    plt.ylabel("NPV (USD)")
+    plt.title(f"Scenario NPV – {design_label}")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # IRR per scenario
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, irrs, color=[colors[i % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, order)
+    plt.ylabel("IRR (%)")
+    plt.title(f"Scenario IRR – {design_label}")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # LCOx per scenario
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, lcoxs, color=[colors[i % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, order)
+    plt.ylabel("LCOx (USD/ton)")
+    plt.title(f"Scenario LCOx – {design_label}")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # BCR per scenario
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, bcrs, color=[colors[i % len(colors)] for i in range(len(idx))])
+    plt.axhline(1.0, linestyle="--", color="black", alpha=0.7, label="BCR = 1")
+    plt.xticks(idx, order)
+    plt.ylabel("Benefit–Cost Ratio (-)")
+    plt.title(f"Scenario Benefit–Cost Ratio – {design_label}")
+    plt.grid(axis="y", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Average Profit per scenario (incl. ESG)
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, avg_pi_plot, color=[colors[i % len(colors)] for i in range(len(idx))])
+    plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+    plt.xticks(idx, order)
+    plt.ylabel("Average annual net profit (USD/year)")
+    plt.title(f"Scenario average net profit (incl. ESG cost) – {design_label}")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# ======================================================================
+#  Parameter input – Commercial TEA
+# ======================================================================
+def get_params_for_design_commercial(idx):
+    print(f"\n================= DESIGN {idx} (Commercial TEA) =================")
+    label = input(f"Name/label for this design (e.g., A, ATR, OxySteam) [default Design_{idx}]: ").strip()
+    if label == "":
+        label = f"Design_{idx}"
+
+    params = {}
+
+    # Required base inputs (direct annual plant numbers)
+    params['C_PE']   = ask_float("Purchased Equipment Cost (USD) [default 1e8, min 1e6]: ",
+                                 default=1e8, min_val=1e6)
+    params['COL']    = ask_float("Annual Operating Labour Cost (USD/year) [default 1e7, min 1e5]: ",
+                                 default=1e7, min_val=1e5)
+    params['C_RM']   = ask_float("Raw Material Cost (USD/year) [default 4e7, min 1e5]: ",
+                                 default=4e7, min_val=1e5)
+    params['C_UT']   = ask_float("Utilities Cost (USD/year) [default 1.2e7, min 1e4]: ",
+                                 default=1.2e7, min_val=1e4)
+    params['C_CAT']  = ask_float("Catalyst Make-up Cost (USD/year) [default 2e6, min 0]: ",
+                                 default=2e6, min_val=0.0)
+    params['Q_prod'] = ask_float("Annual Product Output (ton/year) [default 5e5, min 1e3]: ",
+                                 default=5e5, min_val=1e3)
+    params['P_prod'] = ask_float("Selling Price (USD/ton) [default 550, min 50]: ",
+                                 default=550, min_val=50)
+
+    # Capital multipliers
+    print("\n--- CAPITAL FRACTIONS (Typical Defaults & Bounds) ---")
+    params['f_ins']   = ask_float("Installation Factor [default 0.30, min 0.0, max 3.0]: ",
+                                  default=0.30, min_val=0.0, max_val=3.0)
+    params['f_pipe']  = ask_float("Piping Factor [0.45, min 0.0, max 3.0]: ",
+                                  default=0.45, min_val=0.0, max_val=3.0)
+    params['f_elec']  = ask_float("Electrical Factor [0.10, min 0.0, max 1.0]: ",
+                                  default=0.10, min_val=0.0, max_val=1.0)
+    params['f_bldg']  = ask_float("Buildings Factor [0.15, min 0.0, max 1.0]: ",
+                                  default=0.15, min_val=0.0, max_val=1.0)
+    params['f_util']  = ask_float("Utilities Factor [0.60, min 0.0, max 3.0]: ",
+                                  default=0.60, min_val=0.0, max_val=3.0)
+    params['f_stor']  = ask_float("Storage Factor [0.10, min 0.0, max 1.0]: ",
+                                  default=0.10, min_val=0.0, max_val=1.0)
+    params['f_safe']  = ask_float("Safety Factor [0.05, min 0.0, max 1.0]: ",
+                                  default=0.05, min_val=0.0, max_val=1.0)
+    params['f_waste'] = ask_float("Waste Treatment Factor [0.10, min 0.0, max 2.0]: ",
+                                  default=0.10, min_val=0.0, max_val=2.0)
+
+    # Indirects
+    params['f_eng']   = ask_float("Engineering Fraction [0.20, min 0.0, max 0.5]: ",
+                                  default=0.20, min_val=0.0, max_val=0.5)
+    params['f_cons']  = ask_float("Construction Supervision [0.10, min 0.0, max 0.3]: ",
+                                  default=0.10, min_val=0.0, max_val=0.3)
+    params['f_licn']  = ask_float("Licensing [% of CAPEX] [0.02, min 0.0, max 0.1]: ",
+                                  default=0.02, min_val=0.0, max_val=0.1)
+    params['f_cont']  = ask_float("Contractor Overhead+Profit [0.10, min 0.0, max 0.3]: ",
+                                  default=0.10, min_val=0.0, max_val=0.3)
+    params['f_contg'] = ask_float("Contingency [0.25, min 0.0, max 0.5]: ",
+                                  default=0.25, min_val=0.0, max_val=0.5)
+    params['f_insur'] = ask_float("Insurance [0.02, min 0.0, max 0.1]: ",
+                                  default=0.02, min_val=0.0, max_val=0.1)
+    params['f_own']   = ask_float("Owner’s Cost [0.05, min 0.0, max 0.2]: ",
+                                  default=0.05, min_val=0.0, max_val=0.2)
+    params['f_start'] = ask_float("Start-up & Commissioning [0.08, min 0.0, max 0.3]: ",
+                                  default=0.08, min_val=0.0, max_val=0.3)
+
+    # FINANCE, TAX, ASSET LIFE & PLANT LIFE
+    print("\n--- FINANCE, TAX, ASSET LIFE & PLANT LIFE ---")
+
+    params['L_asset'] = ask_float(
+        "Asset / depreciation life (years) [default 20, min 1]: ",
+        default=20, min_val=1
+    )
+
+    params['tau_inc'] = ask_float(
+        "Income Tax Fraction (0-1) [default 0.30]: ",
+        default=0.30, min_val=0.0, max_val=1.0
+    )
+
+    params['i_base'] = ask_float(
+        "Base Discount Rate (decimal, e.g., 0.1=10%) [default 0.08, min 0, max 0.5]: ",
+        default=0.08, min_val=0.0, max_val=0.5
+    )
+
+    params['delta_risk'] = ask_float(
+        "Risk Premium Addition (extra on discount rate) [default 0.02, min 0, max 0.2]: ",
+        default=0.02, min_val=0.0, max_val=0.2
+    )
+
+    params['N_project'] = int(ask_float(
+        "Plant operating life / project horizon (years) [default 20, min 1]: ",
+        default=20, min_val=1
+    ))
+
+    # Depreciation method(s)
+    dep_raw = input(
+        "Depreciation method(s) [SL=Straight Line, SYD=Sum-of-years, DDB=Double-declining, "
+        "comma-separated or 'ALL'] (default SL): "
+    )
+    dep_raw_u = dep_raw.strip().upper()
+    if dep_raw_u == "" or dep_raw_u is None:
+        dep_methods = ["SL"]
     else:
-        pillar_avgs = st.session_state.pillar_avgs_df.copy()
-        st.write("Pillar Averages:")
-        st.dataframe(pillar_avgs.round(4))
-        st.subheader("Pillar Weights (sum to 100%)")
-        weight_cols = st.columns(len(pillar_avgs.index))
-        weights = {}
-        for i, p in enumerate(pillar_avgs.index):
-            with weight_cols[i]:
-                w = st.number_input(f"{p} (%)", min_value=0.0, max_value=100.0, value=round(100.0 / len(pillar_avgs.index), 2), key=f"w_{p}")
-                weights[p] = float(w)
-        total = sum(weights.values())
-        if abs(total - 100.0) > 1e-6:
-            st.warning(f"Weights sum to {total:.2f}%. They must sum to 100%.")
-        methods_selected = st.multiselect("Select MCDA Methods", options=["WEIGHTED", "WPM", "RANK", "TOPSIS", "VIKOR", "EDAS", "MAUT", "PCA"], default=["WEIGHTED"], key="methods_select")
-        norm_flag = st.checkbox("Normalize outputs to 0–10 scale", value=True, key="norm_flag")
-        if st.button("Run scenarios", key="run_scenarios_btn"):
-            per_method = {}
-            if "WEIGHTED" in methods_selected:
-                per_method["WEIGHTED"] = method_weighted(pillar_avgs, weights)
-            if "WPM" in methods_selected:
-                per_method["WPM"] = method_wpm(pillar_avgs, weights)
-            if "RANK" in methods_selected:
-                per_method["RANK"] = method_rank(pillar_avgs, weights)
-            if "TOPSIS" in methods_selected:
-                per_method["TOPSIS"] = method_topsis(pillar_avgs, weights)
-            if "VIKOR" in methods_selected:
-                per_method["VIKOR"] = method_vikor(pillar_avgs, weights)
-            if "EDAS" in methods_selected:
-                per_method["EDAS"] = method_edas(pillar_avgs, weights)
-            if "MAUT" in methods_selected:
-                per_method["MAUT"] = method_maut(pillar_avgs, weights)
-            if "PCA" in methods_selected:
-                per_method["PCA"] = method_pca(pillar_avgs)
-            scenario_df = pd.DataFrame(per_method)
-            scenario_df.index.name = "Alternative"
-            if norm_flag:
-                scaled_cols = {col: _scale_series_by_method(scenario_df[col], col) for col in scenario_df.columns}
-                scenario_df_scaled = pd.DataFrame(scaled_cols, index=scenario_df.index)
+        if dep_raw_u == "ALL":
+            dep_methods = ["SL", "SYD", "DDB"]
+        else:
+            dep_methods = [m for m in [x.strip() for x in dep_raw_u.split(",")]
+                           if m in ("SL", "SYD", "DDB")]
+            if not dep_methods:
+                dep_methods = ["SL"]
+    params['dep_methods'] = dep_methods
+    params['dep_method'] = dep_methods[0]  # primary method used for visuals
+
+    # Salvage
+    params['salv_frac'] = ask_float(
+        "Salvage value at end of project (fraction of CAPEX, 0-1) [default 0.1]: ",
+        default=0.10, min_val=0.0, max_val=1.0
+    )
+
+    # Risk & carbon (direct, plant-level)
+    params['f_risk_op'] = ask_float(
+        "Operational Risk Factor [default 0.05, min 0, max 0.5]: ",
+        default=0.05, min_val=0.0, max_val=0.5
+    )
+    params['tau_CO2'] = ask_float(
+        "Carbon Tax (USD/ton CO₂) [default 50, min 0, max 500]: ",
+        default=50, min_val=0.0, max_val=500.0
+    )
+    params['E_CO2'] = ask_float(
+        "Annual CO₂ Emissions (ton/year) [default 200000, min 0]: ",
+        default=200000, min_val=0.0
+    )
+    params['f_pack'] = ask_float(
+        "Packaging % of RM cost [Default 0.02, min 0, max 0.2]: ",
+        default=0.02, min_val=0.0, max_val=0.2
+    )
+
+    # ESG / compliance / regulatory cost
+    print("\n--- ESG / Compliance / Regulatory Operating Cost ---")
+    print("Select region for default ESG/compliance cost as % of operating cost:")
+    print("  1 = North America  (typical 5–10% of OPEX)")
+    print("  2 = Europe / UK    (typical 5–10% of OPEX)")
+    print("  3 = Asia-Pacific   (often >10% of OPEX)")
+    print("  4 = Other / custom region")
+    reg_choice = input("Region choice [1/2/3/4, default 3]: ").strip()
+    if reg_choice == "1":
+        region_name = "North America"
+        default_esg_frac = 0.07
+    elif reg_choice == "2":
+        region_name = "Europe / UK"
+        default_esg_frac = 0.07
+    elif reg_choice == "4":
+        region_name = "Other / custom"
+        default_esg_frac = 0.05
+    else:
+        region_name = "Asia-Pacific"
+        default_esg_frac = 0.12
+
+    params['region_esg'] = region_name
+    params['f_esg'] = ask_float(
+        f"Compliance & ESG / regulatory cost as fraction of operating cost "
+        f"for {region_name} [default {default_esg_frac:.2f}, 0–0.5]: ",
+        default=default_esg_frac, min_val=0.0, max_val=0.5
+    )
+
+    params['mode'] = "commercial"
+    return label, params
+
+
+# ======================================================================
+#  Parameter input – Ex-ante TEA
+# ======================================================================
+def get_params_for_design_exante(idx):
+    print(f"\n================= DESIGN {idx} (Ex-ante TEA) =================")
+    label = input(f"Name/label for this ex-ante design (e.g., Pilot→Commercial, FOAK) [default ExAnte_{idx}]: ").strip()
+    if label == "":
+        label = f"ExAnte_{idx}"
+
+    params = {}
+
+    # EX-ANTE CAPEX SCALING
+    print("\n--- EX-ANTE CAPEX SCALING (from reference plant / pilot) ---")
+    Q_ref = ask_float(
+        "Reference plant capacity (ton/year) [default 1e5]: ",
+        default=1e5, min_val=1.0
+    )
+    C_PE_ref = ask_float(
+        "Reference purchased equipment cost at Q_ref (USD) [default 5e7]: ",
+        default=5e7, min_val=1e6
+    )
+    n_capex = ask_float(
+        "CAPEX scaling exponent (0.5–0.9; default 0.6): ",
+        default=0.6, min_val=0.3, max_val=1.0
+    )
+    foak_mult = ask_float(
+        "FOAK / novelty factor on CAPEX (e.g. 1.2 for +20%) [default 1.2]: ",
+        default=1.2, min_val=1.0, max_val=3.0
+    )
+
+    Q_design = ask_float(
+        "Target commercial capacity (ton/year) [default 5e5]: ",
+        default=5e5, min_val=1e3
+    )
+
+    params['Q_ref'] = Q_ref
+    params['C_PE_ref'] = C_PE_ref
+    params['n_capex'] = n_capex
+    params['foak_mult'] = foak_mult
+
+    C_PE_scaled = C_PE_ref * (Q_design / Q_ref)**n_capex * foak_mult
+    print(f"--> Ex-ante scaled C_PE ≈ {C_PE_scaled:,.2f} USD")
+
+    params['C_PE'] = C_PE_scaled
+    params['Q_prod'] = Q_design
+
+    # EX-ANTE OPEX INTENSITIES
+    print("\n--- EX-ANTE OPEX INTENSITIES (per ton of product) ---")
+    c_lab = ask_float(
+        "Labour cost intensity (USD/ton product) [default 20]: ",
+        default=20, min_val=0.0
+    )
+    c_rm = ask_float(
+        "Raw material cost intensity (USD/ton product) [default 300]: ",
+        default=300, min_val=0.0
+    )
+    c_ut = ask_float(
+        "Utilities cost intensity (USD/ton product) [default 50]: ",
+        default=50, min_val=0.0
+    )
+    c_cat = ask_float(
+        "Catalyst/membrane/etc. cost intensity (USD/ton product) [default 10]: ",
+        default=10, min_val=0.0
+    )
+
+    P_prod = ask_float(
+        "Expected selling price (USD/ton) [default 550]: ",
+        default=550, min_val=50
+    )
+
+    params['COL']    = c_lab * params['Q_prod']
+    params['C_RM']   = c_rm  * params['Q_prod']
+    params['C_UT']   = c_ut  * params['Q_prod']
+    params['C_CAT']  = c_cat * params['Q_prod']
+    params['P_prod'] = P_prod
+
+    # Capital multipliers
+    print("\n--- CAPITAL FRACTIONS (Typical Defaults & Bounds) ---")
+    params['f_ins']   = ask_float("Installation Factor [default 0.30, min 0.0, max 3.0]: ",
+                                  default=0.30, min_val=0.0, max_val=3.0)
+    params['f_pipe']  = ask_float("Piping Factor [0.45, min 0.0, max 3.0]: ",
+                                  default=0.45, min_val=0.0, max_val=3.0)
+    params['f_elec']  = ask_float("Electrical Factor [0.10, min 0.0, max 1.0]: ",
+                                  default=0.10, min_val=0.0, max_val=1.0)
+    params['f_bldg']  = ask_float("Buildings Factor [0.15, min 0.0, max 1.0]: ",
+                                  default=0.15, min_val=0.0, max_val=1.0)
+    params['f_util']  = ask_float("Utilities Factor [0.60, min 0.0, max 3.0]: ",
+                                  default=0.60, min_val=0.0, max_val=3.0)
+    params['f_stor']  = ask_float("Storage Factor [0.10, min 0.0, max 1.0]: ",
+                                  default=0.10, min_val=0.0, max_val=1.0)
+    params['f_safe']  = ask_float("Safety Factor [0.05, min 0.0, max 1.0]: ",
+                                  default=0.05, min_val=0.0, max_val=1.0)
+    params['f_waste'] = ask_float("Waste Treatment Factor [0.10, min 0.0, max 2.0]: ",
+                                  default=0.10, min_val=0.0, max_val=2.0)
+
+    # Indirects
+    params['f_eng']   = ask_float("Engineering Fraction [0.20, min 0.0, max 0.5]: ",
+                                  default=0.20, min_val=0.0, max_val=0.5)
+    params['f_cons']  = ask_float("Construction Supervision [0.10, min 0.0, max 0.3]: ",
+                                  default=0.10, min_val=0.0, max_val=0.3)
+    params['f_licn']  = ask_float("Licensing [% of CAPEX] [0.02, min 0.0, max 0.1]: ",
+                                  default=0.02, min_val=0.0, max_val=0.1)
+    params['f_cont']  = ask_float("Contractor Overhead+Profit [0.10, min 0.0, max 0.3]: ",
+                                  default=0.10, min_val=0.0, max_val=0.3)
+    params['f_contg'] = ask_float("Contingency [0.25, min 0.0, max 0.5]: ",
+                                  default=0.25, min_val=0.0, max_val=0.5)
+    params['f_insur'] = ask_float("Insurance [0.02, min 0.0, max 0.1]: ",
+                                  default=0.02, min_val=0.0, max_val=0.1)
+    params['f_own']   = ask_float("Owner’s Cost [0.05, min 0.0, max 0.2]: ",
+                                  default=0.05, min_val=0.0, max_val=0.2)
+    params['f_start'] = ask_float("Start-up & Commissioning [0.08, min 0.0, max 0.3]: ",
+                                  default=0.08, min_val=0.0, max_val=0.3)
+
+    # FINANCE, TAX, ASSET LIFE & PLANT LIFE (EX-ANTE)
+    print("\n--- FINANCE, TAX, ASSET LIFE & PLANT LIFE (EX-ANTE) ---")
+
+    params['L_asset'] = ask_float(
+        "Asset / depreciation life (years) [default 20, min 1]: ",
+        default=20, min_val=1
+    )
+
+    params['tau_inc'] = ask_float(
+        "Income Tax Fraction (0-1) [default 0.30]: ",
+        default=0.30, min_val=0.0, max_val=1.0
+    )
+
+    print("\n--- TECHNOLOGY RISK (TRL-based for ex-ante) ---")
+    TRL = ask_float(
+        "Technology Readiness Level (3–9) [default 6]: ",
+        default=6, min_val=3, max_val=9
+    )
+    params['TRL'] = TRL
+
+    params['i_base'] = ask_float(
+        "Base Discount Rate (firm-level, decimal) [default 0.08]: ",
+        default=0.08, min_val=0.0, max_val=0.5
+    )
+
+    if TRL <= 4:
+        delta_risk = 0.08
+    elif TRL <= 6:
+        delta_risk = 0.05
+    elif TRL <= 8:
+        delta_risk = 0.03
+    else:
+        delta_risk = 0.01
+
+    print(f"--> Ex-ante risk premium added to discount rate based on TRL: {delta_risk:.3f}")
+    params['delta_risk'] = delta_risk
+
+    params['N_project'] = int(ask_float(
+        "Plant operating life / project horizon (years) [default 20, min 1]: ",
+        default=20, min_val=1
+    ))
+
+    # Depreciation method(s) for ex-ante
+    dep_raw = input(
+        "Depreciation method(s) [SL=Straight Line, SYD=Sum-of-years, DDB=Double-declining, "
+        "comma-separated or 'ALL'] (default SL): "
+    )
+    dep_raw_u = dep_raw.strip().upper()
+    if dep_raw_u == "" or dep_raw_u is None:
+        dep_methods = ["SL"]
+    else:
+        if dep_raw_u == "ALL":
+            dep_methods = ["SL", "SYD", "DDB"]
+        else:
+            dep_methods = [m for m in [x.strip() for x in dep_raw_u.split(",")]
+                           if m in ("SL", "SYD", "DDB")]
+            if not dep_methods:
+                dep_methods = ["SL"]
+    params['dep_methods'] = dep_methods
+    params['dep_method'] = dep_methods[0]
+
+    # Salvage
+    params['salv_frac'] = ask_float(
+        "Salvage value at end of project (fraction of CAPEX, 0-1) [default 0.1]: ",
+        default=0.10, min_val=0.0, max_val=1.0
+    )
+
+    # EX-ANTE EMISSIONS & OPERATIONAL RISK
+    print("\n--- EX-ANTE EMISSIONS & OPERATIONAL RISK ---")
+    e_CO2_int = ask_float(
+        "Specific emissions (ton CO₂ / ton product) [default 1.8]: ",
+        default=1.8, min_val=0.0
+    )
+    params['E_CO2'] = e_CO2_int * params['Q_prod']
+
+    params['tau_CO2'] = ask_float(
+        "Carbon Tax (USD/ton CO₂) [default 50]: ",
+        default=50, min_val=0.0, max_val=500.0
+    )
+
+    if TRL <= 4:
+        default_f_risk_op = 0.15
+    elif TRL <= 6:
+        default_f_risk_op = 0.10
+    else:
+        default_f_risk_op = 0.05
+
+    params['f_risk_op'] = ask_float(
+        f"Operational Risk Factor (fraction of DOC) [default {default_f_risk_op:.2f}]: ",
+        default=default_f_risk_op, min_val=0.0, max_val=0.5
+    )
+
+    params['f_pack'] = ask_float(
+        "Packaging % of RM cost [Default 0.02, min 0, max 0.2]: ",
+        default=0.02, min_val=0.0, max_val=0.2
+    )
+
+    # ESG / compliance / regulatory cost (ex-ante)
+    print("\n--- ESG / Compliance / Regulatory Operating Cost (EX-ANTE) ---")
+    print("Select region for default ESG/compliance cost as % of operating cost:")
+    print("  1 = North America  (typical 5–10% of OPEX)")
+    print("  2 = Europe / UK    (typical 5–10% of OPEX)")
+    print("  3 = Asia-Pacific   (often >10% of OPEX)")
+    print("  4 = Other / custom region")
+    reg_choice = input("Region choice [1/2/3/4, default 3]: ").strip()
+    if reg_choice == "1":
+        region_name = "North America"
+        default_esg_frac = 0.07
+    elif reg_choice == "2":
+        region_name = "Europe / UK"
+        default_esg_frac = 0.07
+    elif reg_choice == "4":
+        region_name = "Other / custom"
+        default_esg_frac = 0.05
+    else:
+        region_name = "Asia-Pacific"
+        default_esg_frac = 0.12
+
+    params['region_esg'] = region_name
+    params['f_esg'] = ask_float(
+        f"Compliance & ESG / regulatory cost as fraction of operating cost "
+        f"for {region_name} [default {default_esg_frac:.2f}, 0–0.5]: ",
+        default=default_esg_frac, min_val=0.0, max_val=0.5
+    )
+
+    params['mode'] = "ex-ante"
+    return label, params
+
+
+# ======================================================================
+#  MAIN – multi-design runner
+# ======================================================================
+print("\n=========== COMMERCIAL / EX-ANTE TEA COMPARATOR ===========")
+mode_raw = input("Choose TEA mode: [1] Commercial TEA, [2] Ex-ante TEA (scaled from reference) [default 1]: ").strip()
+if mode_raw == "" or mode_raw == "1":
+    mode = "commercial"
+elif mode_raw == "2":
+    mode = "ex-ante"
+else:
+    mode = "commercial"
+
+n_designs = int(ask_float("How many different designs do you want to compare? [default 1, min 1]: ",
+                          default=1, min_val=1))
+
+all_results = []
+all_params = []
+
+for i in range(1, n_designs+1):
+    if mode == "commercial":
+        label, params = get_params_for_design_commercial(i)
+    else:
+        label, params = get_params_for_design_exante(i)
+
+    while True:
+        print("\n================= RUNNING TEA =================")
+        # run with primary depreciation method for visuals
+        params['dep_method'] = params.get('dep_method', params.get('dep_methods', ["SL"])[0])
+        out = compute_TEA(params)
+        payback = compute_payback(out["CF"])
+        i_eff = params['i_base'] + params['delta_risk']
+
+        # Theoretical IRR from explicit NPV test (same CF), for comparison
+        theoretical_irr = theoretical_irr_from_npv(out["CF"])
+
+        print(f"\nRESULTS for {label}")
+        print(f"Mode    = {params.get('mode', 'n/a').upper()}")
+        if params.get('mode') == "ex-ante":
+            print(f"TRL     = {params.get('TRL', 'n/a')}")
+            print(f"Q_ref   = {params.get('Q_ref', 'n/a')} ton/yr,  C_PE_ref = {params.get('C_PE_ref', 'n/a')} USD")
+            print(f"Scale n = {params.get('n_capex', 'n/a')}, FOAK mult = {params.get('foak_mult', 'n/a')}")
+        print(f"Primary depreciation method  : {params['dep_method']}")
+        print(f"Region for ESG/compliance    : {params.get('region_esg', 'n/a')}")
+        print(f"CAPEX   = {out['CAPEX']:.2f} USD")
+        print(f"LCOx    = {out['LCOx']:.3f} USD/ton")
+        print(f"NPV     = {out['NPV']:.2f} USD")
+        print(f"Project IRR (from TEA CF)    = {out['IRR']*100:.2f}%")
+        print(f"Theoretical IRR (NPV=0 test) = {theoretical_irr*100:.2f}%")
+        print(f"IRR difference (Proj - Theo) = {(out['IRR']-theoretical_irr)*100:.3f} %-points")
+        print(f"Salvage value (end of proj.) : {out['Salvage']:.2f} USD")
+        print(f"Capital Recovery Factor (CRF): {out['CRF']:.5f}")
+        print(f"Annualised CAPEX (via CRF)   : {out['Annual_CAPEX']:.2f} USD/yr")
+        if payback is not None:
+            print(f"Payback time ≈ {payback:.2f} years")
+        else:
+            print("Payback time: not reached within project horizon")
+        print(f"PV of Revenues (no tax)      : {out['PV_revenue']:.2f} USD")
+        print(f"PV of Total Costs            : {out['PV_cost_total']:.2f} USD")
+        print(f"Benefit–Cost Ratio (BCR)     : {out['BCR']:.3f}")
+
+        esg_cost = out.get("esg_cost", 0.0)
+        oc_base = out.get("OC_base", out["OC"])
+        esg_pct = (esg_cost / oc_base * 100.0) if oc_base > 0 else 0.0
+        print(f"ESG/compliance cost (OPEX add-on): {esg_cost:.2f} USD/yr "
+              f"(~{esg_pct:.2f}% of base OPEX)")
+
+        # --- Extra check: required selling price for a target "good" IRR ---
+        run_price_target = input(
+            "\nCompute selling price required to reach a target IRR? [y/N]: "
+        ).strip().lower()
+        if run_price_target == "y":
+            target_irr_pct = ask_float(
+                "Target IRR (%) you consider 'good' [default 15]: ",
+                default=15.0, min_val=-50.0, max_val=200.0
+            )
+            target_irr = target_irr_pct / 100.0
+            p_req, out_req = price_for_target_irr(params, target_irr)
+            if p_req is None or out_req is None:
+                print("  Could not bracket a selling price that reaches the target IRR with current settings.")
             else:
-                scenario_df_scaled = scenario_df.copy()
-            scenario_name = f"Scenario {len(st.session_state.scenario_results) + 1}"
-            st.session_state.scenario_results[scenario_name] = {"weights": weights, "methods": methods_selected, "results": scenario_df_scaled}
-            st.session_state.last_weights = weights
-            st.session_state.last_methods = methods_selected
-        if st.session_state.scenario_results:
-            st.subheader("Stored Scenarios")
-            for name, sdata in st.session_state.scenario_results.items():
-                st.markdown(f"**{name}** — Methods: {', '.join(sdata['methods'])}")
-                st.dataframe(sdata["results"].round(4))
-            try:
-                all_plot_data = []
-                for name, sdata in st.session_state.scenario_results.items():
-                    df = sdata["results"].copy()
-                    df["Scenario"] = name
-                    all_plot_data.append(df.reset_index().melt(id_vars=["Alternative", "Scenario"], var_name="Method", value_name="Score"))
-                plot_df = pd.concat(all_plot_data, ignore_index=True)
-                fig = px.bar(plot_df, x="Alternative", y="Score", color="Method", barmode="group", facet_row="Scenario", title="Scenario Comparisons by Method")
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception:
-                pass
-            last_key = list(st.session_state.scenario_results.keys())[-1]
-            last_df = st.session_state.scenario_results[last_key]["results"]
-            csv_b = io.BytesIO()
-            last_df.to_csv(csv_b)
-            csv_b.seek(0)
-            st.download_button("Download latest scenario (CSV)", data=csv_b, file_name=f"{last_key.replace(' ','_')}.csv", mime="text/csv")
+                print(f"\nRequired selling price for IRR ≈ {target_irr_pct:.2f}%:")
+                print(f"  P_prod ≈ {p_req:.3f} USD/ton")
+                print(f"  -> IRR ≈ {out_req['IRR']*100:.2f}%")
+                print(f"  -> LCOx ≈ {out_req['LCOx']:.3f} USD/ton")
+                print(f"  -> NPV  ≈ {out_req['NPV']:.2f} USD")
 
-# ----------------------- Tab 3: Validation ----------------
-with tabs[3]:
-    st.header("Validation — DEA (approx) & Monte Carlo")
-    if st.session_state.pillar_avgs_df.empty:
-        st.info("Need pillar averages (from ESGFP tab).")
-    else:
-        pillar_avgs = st.session_state.pillar_avgs_df.copy()
-        st.write("Pillar Averages:")
-        st.dataframe(pillar_avgs.round(4))
-        dea_samples = st.number_input("DEA convex-hull samples", min_value=100, max_value=200000, value=5000, step=100, key="dea_samples")
-        peer_cut = st.number_input("Peer display cutoff", min_value=0.0, max_value=1.0, value=0.05, step=0.01, key="peer_cut")
-        sims = st.number_input("Monte Carlo sims", min_value=100, max_value=200000, value=2000, step=100, key="mc_sims")
-        alpha = st.number_input("Dirichlet alpha", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key="mc_alpha")
-        sigma = st.number_input("Score noise sigma", min_value=0.0, max_value=0.5, value=0.03, step=0.01, key="mc_sigma")
-        if st.button("Run validation suite", key="run_validation_btn"):
-            with st.spinner("Running DEA diagnostics."):
-                dea_summary, peer_matrix, bottleneck_matrix, targets = approx_dea_diagnostics(
-                    pillar_avgs, samples=int(dea_samples), min_peer_lambda=float(peer_cut)
-                )
-            st.subheader("DEA Summary")
-            st.dataframe(dea_summary.round(4))
-            # Bottleneck heatmap
-            try:
-                fig, ax = plt.subplots(figsize=(10,6))
-                im = ax.imshow(bottleneck_matrix.values, aspect="auto", cmap="OrRd")
-                ax.set_xticks(range(bottleneck_matrix.shape[1])); ax.set_xticklabels(bottleneck_matrix.columns, rotation=45, ha="right")
-                ax.set_yticks(range(bottleneck_matrix.shape[0])); ax.set_yticklabels(bottleneck_matrix.index)
-                for i in range(bottleneck_matrix.shape[0]):
-                    for j in range(bottleneck_matrix.shape[1]):
-                        ax.text(j, i, f"{bottleneck_matrix.values[i,j]:.2f}", ha="center", va="center", fontsize=9)
-                ax.set_title("DEA Bottleneck Frequency by Pillar")
-                st.pyplot(fig)
-            except Exception:
-                pass
-            # Peer heatmap
-            try:
-                fig, ax = plt.subplots(figsize=(10,8))
-                im = ax.imshow(peer_matrix.values, aspect="auto", cmap="Blues")
-                ax.set_xticks(range(peer_matrix.shape[1])); ax.set_xticklabels(peer_matrix.columns, rotation=45, ha="right")
-                ax.set_yticks(range(peer_matrix.shape[0])); ax.set_yticklabels(peer_matrix.index)
-                for i in range(peer_matrix.shape[0]):
-                    for j in range(peer_matrix.shape[1]):
-                        val = peer_matrix.values[i, j]
-                        if val > 0:
-                            ax.text(j, i, f"{val:.2f}", ha="center", va="center", fontsize=9)
-                ax.set_title("DEA Peer Reference Weights (avg best mix)")
-                st.pyplot(fig)
-            except Exception:
-                pass
-            dom = compute_dominance_matrix(pillar_avgs)
-            st.subheader("Dominance matrix")
-            st.dataframe(dom)
-            with st.spinner("Running Monte-Carlo sensitivity."):
-                Pbest, MeanRank, StdRank, RankDist = run_monte_carlo_sensitivity(
-                    pillar_avgs,
-                    st.session_state.last_weights if st.session_state.last_weights is not None else {p: 100.0/len(pillar_avgs.index) for p in pillar_avgs.index},
-                    st.session_state.last_methods if st.session_state.last_methods is not None else ["WEIGHTED"],
-                    sims=int(sims),
-                    weight_alpha=float(alpha),
-                    score_noise_sigma=float(sigma),
-                )
-            st.subheader("Monte-Carlo: P(Best)")
-            st.dataframe(Pbest.round(4))
-            if "WEIGHTED" in Pbest.columns:
-                fig = px.bar(Pbest.reset_index(), x="Tech", y="WEIGHTED", title="Monte-Carlo P(Best) — WEIGHTED")
-                st.plotly_chart(fig, use_container_width=True)
-            if "WEIGHTED" in RankDist:
-                try:
-                    rd = RankDist["WEIGHTED"]
-                    fig = go.Figure()
-                    ranks = list(rd.columns)
-                    x = rd.index.tolist()
-                    for col in ranks:
-                        fig.add_trace(go.Bar(name=col, x=x, y=rd[col], offsetgroup=0))
-                    fig.update_layout(barmode="stack", title="Rankogram — WEIGHTED")
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception:
-                    pass
-            st.subheader("Mean Rank & StdDev")
-            st.dataframe(MeanRank.round(4))
-            st.dataframe(StdRank.round(4))
+        # ---- Depreciation-method comparison table (if multiple) ----
+        dep_methods = params.get('dep_methods', [params['dep_method']])
+        if len(dep_methods) > 1:
+            rows_dm = []
+            for m in dep_methods:
+                p_m = params.copy()
+                p_m['dep_method'] = m
+                out_m = compute_TEA(p_m)
+                pb_m = compute_payback(out_m["CF"])
+                rows_dm.append({
+                    "Dep_Method": m,
+                    "NPV": out_m["NPV"],
+                    "IRR_%": out_m["IRR"]*100.0,
+                    "Payback_yrs": pb_m,
+                    "Annual_CAPEX": out_m["Annual_CAPEX"]
+                })
+            df_dm = pd.DataFrame(rows_dm)
+            print("\nDepreciation-method comparison (same design economics):")
+            with pd.option_context('display.max_columns', None):
+                print(df_dm.to_string(index=False,
+                                      float_format=lambda x: f"{x:,.3g}"))
 
-# ----------------------- Tab 4: Export Reports ----------------
-with tabs[4]:
-    st.header("Export Reports (PDF)")
-    def collect_risk_section():
-        tables = []
-        images = []
-        if st.session_state.risks:
-            df_r = pd.DataFrame([{"Risk": r["name"], "Probability": r["prob"], "Severity": r["sev"], "Rating": r["prob"] * r["sev"]} for r in st.session_state.risks])
-            tables.append((df_r, "Risk table"))
-            try:
-                before = plt.get_fignums()
-                plot_risk_views(df_r)
-                for num in plt.get_fignums():
-                    if num not in before:
-                        fig = plt.figure(num)
-                        png = mpl_fig_to_png_bytes(fig)
-                        images.append((png, "Risk visuals"))
-            except Exception:
-                pass
-        return {"heading":"Risk Assessment", "text":"Risk inputs & visuals", "tables": tables, "images": images}
+        # ---- Income Statement per year (using primary method) ----
+        N = params['N_project']
+        years = np.arange(1, N+1)
+        dep_sched = out["dep_schedule"]
+        EBT_sched = out["EBT_schedule"]
+        tax_sched = out["tax_schedule"]
 
-    def collect_esgfp_section():
-        tables = []
-        images = []
-        if st.session_state.scores_by_tech:
-            df_scores = pd.DataFrame(st.session_state.scores_by_tech)
-            tables.append((df_scores.round(6), "ESGFP scores (Techs x Pillar:Key)"))
-        if not st.session_state.pillar_avgs_df.empty:
-            pa = st.session_state.pillar_avgs_df
-            tables.append((pa.round(6), "Pillar averages"))
-            try:
-                before = plt.get_fignums()
-                plot_pillar_heatmaps(pa)
-                plot_radar_profiles(pa)
-                for num in plt.get_fignums():
-                    if num not in before:
-                        fig = plt.figure(num)
-                        images.append((mpl_fig_to_png_bytes(fig), "Pillar visuals"))
-            except Exception:
-                pass
-        return {"heading":"ESGFP Scoring", "text":"Process designs, scores, and pillar averages", "tables": tables, "images": images}
+        revenue = np.full_like(years, out["R"], dtype=float)
+        opex = np.full_like(years, out["OC"], dtype=float)
+        depreciation = dep_sched[1:N+1]
+        ebit = EBT_sched[1:N+1]           # EBIT = EBT here (no interest terms)
+        tax = tax_sched[1:N+1]
+        net_income = ebit - tax
+        ebitda = revenue - opex           # EBITDA = Revenue - OPEX
 
-    def collect_scenario_section():
-        tables = []
-        images = []
-        if not st.session_state.pillar_avgs_df.empty and st.session_state.last_weights is not None and st.session_state.last_methods is not None:
-            pa = st.session_state.pillar_avgs_df
-            per_method = {}
-            last_methods = st.session_state.last_methods
-            weights = st.session_state.last_weights
-            per_method["WEIGHTED"] = method_weighted(pa, weights)
-            for m in last_methods:
-                if m == "WPM": per_method["WPM"] = method_wpm(pa, weights)
-                if m == "RANK": per_method["RANK"] = method_rank(pa, weights)
-                if m == "TOPSIS": per_method["TOPSIS"] = method_topsis(pa, weights)
-                if m == "VIKOR": per_method["VIKOR"] = method_vikor(pa, weights)
-                if m == "EDAS": per_method["EDAS"] = method_edas(pa, weights)
-                if m == "MAUT": per_method["MAUT"] = method_maut(pa, weights)
-                if m == "PCA": per_method["PCA"] = method_pca(pa)
-            scenario_df = pd.DataFrame(per_method)
-            tables.append((scenario_df.round(6), "Scenario results"))
-            try:
-                fig = px.bar(scenario_df.reset_index().melt(id_vars="index", var_name="Method", value_name="Score"), x="index", y="Score", color="Method", barmode="group")
-                img = fig.to_image(format="png")
-                images.append((img, "Scenario comparison"))
-            except Exception:
-                pass
-        return {"heading":"Scenarios", "text":"MCDA scenario results (if available)", "tables": tables, "images": images}
+        df_is = pd.DataFrame({
+            "Year": years,
+            "Revenue": revenue,
+            "OPEX": opex,
+            "EBITDA": ebitda,
+            "Depreciation": depreciation,
+            "EBIT": ebit,
+            "Tax": tax,
+            "Net_Income": net_income
+        })
 
-    sections = []
-    sections.append(collect_risk_section())
-    sections.append(collect_esgfp_section())
-    sections.append(collect_scenario_section())
-    pdf_bytes = build_pdf_report("Risk Assessment Toolkit Report", sections)
-    if pdf_bytes:
-        st.download_button("Download combined report (PDF)", data=pdf_bytes, file_name="pro_desg_report.pdf", mime="application/pdf")
+        print(f"\nIncome Statement (per operating year) – {label} "
+              f"(primary depreciation method: {params['dep_method']})")
+        with pd.option_context('display.max_rows', None,
+                               'display.max_columns', None):
+            print(df_is.to_string(index=False,
+                                  float_format=lambda x: f"{x:,.3g}"))
 
-# ----------------------- Tab 5: Compliance / ESG TEA ----------------
-with tabs[5]:
-    st.header("Compliance / ESG TEA")
-    st.write("Run the TEA/compliance module and view results and plots. Upload your compliance script (.py) or use the default uploaded one.")
-    user_path = st.text_input("Compliance script path (local)", DEFAULT_COMPLIANCE_PATH, key="comp_path")
-    uploaded_file = st.file_uploader("(Optional) Upload a compliance script to use instead", type=["py"], key="comp_upload")
-    module_path = None
-    if uploaded_file is not None:
-        try:
-            temp_dir = tempfile.gettempdir()
-            tmp_path = os.path.join(temp_dir, "compliance_uploaded.py")
-            with open(tmp_path, "wb") as fh:
-                fh.write(uploaded_file.read())
-            module_path = tmp_path
-            st.success(f"Uploaded script saved to: {tmp_path}")
-        except Exception as e:
-            st.error(f"Could not save uploaded script: {e}")
-            module_path = user_path
-    else:
-        module_path = user_path
+        # ---- ROI CALCULATIONS ----
+        CAPEX_tot = out["CAPEX"]
+        total_net_income = float(np.sum(net_income))
+        avg_net_income = float(np.mean(net_income))
 
-    comp_mod = None
-    try:
-        comp_mod = load_compliance_module(module_path)
-    except Exception as e:
-        st.error(f"Could not load compliance module: {e}")
-        comp_mod = None
+        ROI_total = total_net_income / CAPEX_tot if CAPEX_tot != 0 else 0.0
+        ROI_avg = avg_net_income / CAPEX_tot if CAPEX_tot != 0 else 0.0
+        ROI_yearly_pct = (net_income / CAPEX_tot * 100.0) if CAPEX_tot != 0 else np.zeros_like(net_income)
 
-    if comp_mod is not None:
-        if not hasattr(comp_mod, "compute_TEA"):
-            st.error("Loaded compliance script does not expose `compute_TEA(params)` function.")
+        print(f"\nROI metrics (based on Net Income and total CAPEX):")
+        print(f"  Total ROI over project life (Σ Net Income / CAPEX) : {ROI_total*100:.2f}%")
+        print(f"  Average annual ROI (mean Net Income / CAPEX)       : {ROI_avg*100:.2f}%")
+
+        # ---- Financial visual: multi-colour Income Statement ----
+        plt.figure(figsize=(9, 5), dpi=200)
+        bar_width = 0.7
+        plt.bar(years, revenue, width=bar_width, alpha=0.5,
+                label="Revenue", color="tab:blue", edgecolor="black", linewidth=0.4)
+        plt.bar(years, opex, width=bar_width*0.7, alpha=0.6,
+                label="OPEX", color="tab:orange", edgecolor="black", linewidth=0.4)
+        plt.bar(years, depreciation, width=bar_width*0.4, alpha=0.7,
+                label="Depreciation", color="tab:red", edgecolor="black", linewidth=0.4)
+        plt.plot(years, net_income, marker="o", linewidth=2.0,
+                 color="tab:green", label="Net Income")
+
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        plt.xlabel("Year")
+        plt.ylabel("USD/year")
+        plt.title(f"Income Statement Profile – {label}")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # ---- EBIT & EBITDA GRAPH ----
+        plt.figure(figsize=(9, 5), dpi=200)
+        plt.plot(years, ebitda, marker="o", linewidth=2.0,
+                 label="EBITDA", color="tab:purple")
+        plt.plot(years, ebit, marker="s", linewidth=2.0,
+                 label="EBIT", color="tab:blue")
+        plt.plot(years, net_income, marker="^", linewidth=2.0,
+                 label="Net Income", color="tab:green")
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        plt.xlabel("Year")
+        plt.ylabel("USD/year")
+        plt.title(f"EBITDA / EBIT / Net Income – {label}")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # ---- ROI GRAPH ----
+        plt.figure(figsize=(7, 4), dpi=200)
+        plt.bar(years, ROI_yearly_pct, color="tab:purple", edgecolor="black", linewidth=0.4)
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        plt.xlabel("Year")
+        plt.ylabel("ROI per year (% of CAPEX)")
+        plt.title(f"Yearly ROI (Net Income / CAPEX) – {label}")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        # ---- NPV vs Discount Rate with Project IRR vs Theoretical IRR ----
+        CF_arr = np.array(out["CF"], dtype=float)
+        r_min = -0.5
+        r_max = max(0.5, out["IRR"]*3 + 0.1)
+        r_grid = np.linspace(r_min, r_max, 300)
+
+        def npv_at_rate(cf, r):
+            r_eff = max(r, -0.9999)
+            t = np.arange(cf.size, dtype=float)
+            return np.sum(cf / (1.0 + r_eff)**t)
+
+        npv_grid = [npv_at_rate(CF_arr, r) for r in r_grid]
+
+        plt.figure(figsize=(8, 4), dpi=200)
+        plt.plot(r_grid*100.0, npv_grid, label="NPV vs discount rate")
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        plt.axvline(out["IRR"]*100.0, linestyle="-", color="tab:red",
+                    label="Project IRR (from TEA)")
+        plt.axvline(theoretical_irr*100.0, linestyle="--", color="tab:blue",
+                    label="Theoretical IRR (NPV=0)")
+        plt.xlabel("Discount rate (%)")
+        plt.ylabel("NPV (USD)")
+        plt.title(f"NPV vs Discount Rate – {label}")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        years_cf = np.arange(len(out["CF"]))
+
+        # Annual CF (multi-colour bar: CAPEX, +CF, -CF)
+        colors_cf = []
+        for t, v in enumerate(out["CF"]):
+            if t == 0:
+                colors_cf.append("tab:gray")
+            elif v >= 0:
+                colors_cf.append("tab:green")
+            else:
+                colors_cf.append("tab:red")
+
+        plt.figure(figsize=(7, 4), dpi=200)
+        plt.bar(years_cf, out["CF"], color=colors_cf, edgecolor="black", linewidth=0.4)
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        plt.grid(True, alpha=0.3)
+        plt.title(f"Annual Cashflow – {label}")
+        plt.xlabel("Year")
+        plt.ylabel("Cashflow (USD)")
+        plt.tight_layout()
+        plt.show()
+
+        # Cumulative CF + payback (engineering style)
+        cum_cf = np.cumsum(out["CF"])
+        plt.figure(figsize=(7, 4), dpi=200)
+        plt.plot(years_cf, cum_cf, marker="o", label="Cumulative CF", color="tab:blue")
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        if payback is not None:
+            plt.axvline(payback, linestyle="--", color="tab:red", label=f"Payback ≈ {payback:.2f} yr")
+        plt.grid(True, alpha=0.3)
+        plt.title(f"Cumulative Cashflow – {label}")
+        plt.xlabel("Year")
+        plt.ylabel("Cumulative CF (USD)")
+        if payback is not None:
+            plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # Discounted CF and cumulative discounted CF
+        disc_cf = [out["CF"][t] / ((1 + i_eff)**t) for t in range(len(out["CF"]))]
+        cum_disc = np.cumsum(disc_cf)
+        plt.figure(figsize=(7, 4), dpi=200)
+        plt.plot(years_cf, disc_cf, marker="o", label="Discounted CF", color="tab:purple")
+        plt.plot(years_cf, cum_disc, marker="s", label="Cum. discounted CF", color="tab:green")
+        plt.axhline(0.0, linestyle="--", color="black", alpha=0.7)
+        plt.grid(True, alpha=0.3)
+        plt.title(f"Discounted Cashflow Profile – {label}")
+        plt.xlabel("Year")
+        plt.ylabel("USD")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # --- CAPEX breakdown (engineering visual) ---
+        C_PE = out["C_PE"]
+        C_INS   = params['f_ins']   * C_PE
+        C_PIPE  = params['f_pipe']  * C_PE
+        C_ELEC  = params['f_elec']  * C_PE
+        C_BLDG  = params['f_bldg']  * C_PE
+        C_UTIL  = params['f_util']  * C_PE
+        C_STOR  = params['f_stor']  * C_PE
+        C_SAFE  = params['f_safe']  * C_PE
+        C_WASTE = params['f_waste'] * C_PE
+
+        DCC = C_PE + C_INS + C_PIPE + C_ELEC + C_BLDG + C_UTIL + C_STOR + C_SAFE + C_WASTE
+        C_ENG   = params['f_eng']   * DCC
+        C_CONS  = params['f_cons']  * DCC
+        C_LICN  = params['f_licn']  * DCC
+        C_CONT  = params['f_cont']  * DCC
+        C_CONTG = params['f_contg'] * DCC
+        C_INSUR = params['f_insur'] * DCC
+        C_OWN   = params['f_own']   * DCC
+        C_START = params['f_start'] * DCC
+
+        cap_labels = [
+            "C_PE", "Installation", "Piping", "Electrical", "Buildings", "Utilities",
+            "Storage", "Safety", "Waste treat.",
+            "Eng.", "Constr. Superv.", "Licensing", "Contractor O/H+Profit",
+            "Contingency", "Insurance", "Owner’s cost", "Start-up"
+        ]
+        cap_vals = [
+            C_PE, C_INS, C_PIPE, C_ELEC, C_BLDG, C_UTIL,
+            C_STOR, C_SAFE, C_WASTE,
+            C_ENG, C_CONS, C_LICN, C_CONT,
+            C_CONTG, C_INSUR, C_OWN, C_START
+        ]
+
+        cap_pairs = sorted(zip(cap_vals, cap_labels), key=lambda z: z[0], reverse=True)
+        sorted_vals, sorted_labels = zip(*cap_pairs)
+
+        y_pos = np.arange(len(sorted_labels))
+        plt.figure(figsize=(8, 6), dpi=200)
+        plt.barh(y_pos, sorted_vals, color="tab:blue", alpha=0.8)
+        plt.xlabel("Cost (USD)")
+        plt.title(f"CAPEX breakdown – {label}")
+        plt.yticks(y_pos, sorted_labels)
+        plt.gca().invert_yaxis()
+        plt.grid(axis="x", alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        # --- OPEX breakdown pie (DOC, FOC, GMC, risk, CO₂, ESG) ---
+        DOC = out["DOC"]
+        FOC = out["FOC"]
+        GMC = out["GMC"]
+        risk_cost = out["risk_cost"]
+        co2_cost = out["co2_cost"]
+        esg_cost = out.get("esg_cost", 0.0)
+
+        opex_labels = ["DOC", "FOC", "GMC", "Op. risk", "CO₂ cost", "ESG & compliance"]
+        opex_vals = [DOC, FOC, GMC, risk_cost, co2_cost, esg_cost]
+
+        plt.figure(figsize=(6, 6), dpi=200)
+        plt.pie(
+            opex_vals,
+            labels=opex_labels,
+            autopct="%1.1f%%",
+            startangle=90,
+        )
+        plt.title(f"OPEX breakdown – {label}")
+        plt.tight_layout()
+        plt.show()
+
+        # === Sensitivity analysis (tornado, with user swing) ===
+        run_sens = input("\nRun sensitivity (tornado) for this design? [y/N]: ").strip().lower()
+        if run_sens == "y":
+            swing_pct = ask_float("Sensitivity +/- percent (e.g., 20 for ±20%) [default 20]: ",
+                                  default=20, min_val=0.0, max_val=200.0)
+            swing = swing_pct / 100.0
+
+            print("\nDefault sensitivity parameters:")
+            default_keys = ['C_PE', 'C_RM', 'C_UT', 'COL', 'Q_prod', 'P_prod', 'tau_CO2', 'E_CO2', 'f_esg']
+            print("  " + ", ".join(default_keys))
+            use_default = input("Use default list? [Y/n]: ").strip().lower()
+            if use_default in ("", "y"):
+                sens_keys = [k for k in default_keys if k in params]
+            else:
+                raw_list = input("Enter comma-separated parameter names (must be keys in params): ")
+                sens_keys = [x.strip() for x in raw_list.split(",") if x.strip() in params]
+                if not sens_keys:
+                    sens_keys = [k for k in default_keys if k in params]
+
+            tornado_sensitivity(params, sens_keys, swing=swing)
+
+        # === Monte Carlo ===
+        run_mc = input("\nRun Monte-Carlo uncertainty for this design? [y/N]: ").strip().lower()
+        if run_mc == "y":
+            interactive_monte_carlo(params)
+
+        # === Price / RM sweeps ===
+        run_sweep = input("\nRun price & raw-material sweeps for this design? [y/N]: ").strip().lower()
+        if run_sweep == "y":
+            print("\n--- Price sweep (NPV & LCOx vs selling price) ---")
+            price_sweep(params, swing=0.30, n=25)
+            print("\n--- Raw-material cost sweep (NPV & LCOx vs C_RM) ---")
+            raw_material_sweep(params, swing=0.30, n=25)
+
+        # === Scenario cost–benefit analysis ===
+        run_sc = input("\nRun scenario cost–benefit analysis (optimistic / moderate / pessimistic)? [y/N]: ").strip().lower()
+        if run_sc == "y":
+            scenario_cba(params, label)
+
+        # === Critical multi-colour pairwise impact visualisation ===
+        run_pair = input("\nRun critical multi-colour pairwise impact visualisation? [y/N]: ").strip().lower()
+        if run_pair == "y":
+            interactive_pairwise_visual(params)
+
+        # === NEW: ESG/compliance sweep 5% -> 75% ===
+        run_esg = input("\nRun ESG/compliance sweep 5%→75% (OPEX, IRR, NPV, Price-to-hold-IRR, ROI, Revenue, EBITDA, EBIT, Payback)? [y/N]: ").strip().lower()
+        if run_esg == "y":
+            # You can tweak n for smoothness (e.g., 15–25)
+            run_esg_sweep_and_plots(params, design_label=label, f_min=0.05, f_max=0.75, n=17)
+
+        # After all visuals, ask user if they want to edit/re-run
+        print("\nOptions for this design:")
+        print("  [1] Change one or more inputs and re-run")
+        print("  [2] Accept this design and continue to next")
+        choice = input("Enter choice [1/2, default 2]: ").strip()
+
+        if choice == "1":
+            params = interactive_edit_params(params)
+            continue
         else:
-            # Build defaults and UI for many TEA params
-            st.subheader("TEA Parameters (edit values or use JSON editor)")
-            base_params = {
-                "C_PE": 1e8, "COL": 1e7, "C_RM": 4e7, "C_UT": 1.2e7, "C_CAT": 2e6,
-                "Q_prod": 5e5, "P_prod": 550.0, "f_ins": 0.30, "f_pipe": 0.45, "f_elec": 0.10,
-                "f_bldg": 0.05, "f_util": 0.06, "f_stor": 0.02, "f_safe": 0.01, "f_waste": 0.01,
-                "f_eng": 0.12, "f_cons": 0.10, "f_licn": 0.00, "f_cont": 0.02, "f_contg": 0.0,
-                "f_insur": 0.01, "f_own": 0.02, "f_start": 0.01,
-                "N_project": 20, "L_asset": 20, "salv_frac": 0.10, "f_risk_op": 0.05,
-                "tau_CO2": 50.0, "E_CO2": 200000.0, "f_pack": 0.02, "f_esg": 0.07,
-                "i_base": 0.08, "delta_risk": 0.03, "dep_method": "SL"
-            }
-            if hasattr(comp_mod, "base_params") and isinstance(getattr(comp_mod, "base_params"), dict):
-                try:
-                    base_params.update(getattr(comp_mod, "base_params"))
-                except Exception:
-                    pass
+            all_results.append({
+                "label": label,
+                "CAPEX": out["CAPEX"],
+                "LCOx": out["LCOx"],
+                "NPV": out["NPV"],
+                "IRR": out["IRR"],
+                "Payback": payback,
+                "BCR": out["BCR"],
+                "ROI_total": ROI_total,
+                "ROI_avg": ROI_avg
+            })
+            all_params.append(params)
+            break
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                base_params["C_PE"] = st.number_input("C_PE (USD)", value=float(base_params["C_PE"]), format="%.2f", key="C_PE")
-                base_params["C_RM"] = st.number_input("C_RM (USD/yr)", value=float(base_params["C_RM"]), format="%.2f", key="C_RM")
-                base_params["P_prod"] = st.number_input("P_prod (USD/ton)", value=float(base_params["P_prod"]), format="%.2f", key="P_prod")
-            with c2:
-                base_params["Q_prod"] = st.number_input("Q_prod (ton/yr)", value=float(base_params["Q_prod"]), format="%.2f", key="Q_prod")
-                base_params["COL"] = st.number_input("COL (USD/yr)", value=float(base_params["COL"]), format="%.2f", key="COL")
-                base_params["f_esg"] = st.number_input("f_esg (fraction of OPEX)", value=float(base_params["f_esg"]), format="%.4f", key="f_esg")
-            with c3:
-                base_params["N_project"] = st.number_input("N_project (yrs)", value=int(base_params["N_project"]), min_value=1, key="N_project")
-                base_params["i_base"] = st.number_input("i_base (discount rate)", value=float(base_params["i_base"]), format="%.4f", key="i_base")
-                base_params["dep_method"] = st.selectbox("dep_method", options=["SL","SYD","DDB"], index=0, key="dep_method")
 
-            st.markdown("**Advanced parameters (JSON editor)** — edit freely then press *Apply JSON*")
-            params_json = st.text_area("params JSON", value=json.dumps(base_params, indent=2), height=240, key="params_json")
+# ======================================================================
+#  Cross-design comparison plots
+# ======================================================================
+if n_designs > 1:
+    labels = [r["label"] for r in all_results]
+    idx = np.arange(len(labels))
 
-            if st.button("Apply JSON", key="apply_json_btn"):
-                try:
-                    parsed = json.loads(params_json)
-                    if isinstance(parsed, dict):
-                        base_params.update(parsed)
-                        st.success("Applied JSON parameters.")
-                    else:
-                        st.error("JSON must encode a dictionary of parameters.")
-                except Exception as e:
-                    st.error(f"Invalid JSON: {e}")
+    CAPEX_vals = [r["CAPEX"] for r in all_results]
+    LCOx_vals  = [r["LCOx"] for r in all_results]
+    NPV_vals   = [r["NPV"] for r in all_results]
+    IRR_vals   = [r["IRR"]*100.0 for r in all_results]
+    PB_vals    = [r["Payback"] if r["Payback"] is not None else np.nan
+                  for r in all_results]
+    BCR_vals   = [r["BCR"] for r in all_results]
+    ROI_totals = [r.get("ROI_total", 0.0)*100.0 for r in all_results]
+    ROI_avgs   = [r.get("ROI_avg", 0.0)*100.0 for r in all_results]
 
-            run_col, save_col = st.columns([1,1])
-            if run_col.button("Run TEA (compute_TEA)", key="run_tea_btn"):
-                with st.spinner("Running TEA..."):
-                    try:
-                        out = comp_mod.compute_TEA(base_params)
-                    except Exception as e:
-                        st.exception(f"compute_TEA raised an exception: {e}")
-                        out = None
-                if out is not None:
-                    st.success("TEA computed.")
-                    keys = ["CAPEX", "LCOx", "NPV", "IRR", "Salvage", "CRF", "Annual_CAPEX", "PV_revenue", "PV_cost_total", "BCR"]
-                    st.subheader("Key TEA Results")
-                    for k in keys:
-                        if k in out:
-                            try:
-                                if k == "IRR":
-                                    st.write(f"{k}: {float(out[k])*100:.3f}%")
-                                else:
-                                    st.write(f"{k}: {out[k]}")
-                            except Exception:
-                                st.write(f"{k}: {out[k]}")
-                    others = {k: v for k, v in out.items() if k not in keys and (isinstance(v, (int, float, str)) or (isinstance(v, (list,tuple, np.ndarray)) and len(v)<=100))}
-                    if others:
-                        st.subheader("Other outputs (sample)")
-                        st.write(others)
-                    if "CF" in out:
-                        try:
-                            cf = list(out["CF"])
-                            years = list(range(len(cf)))
-                            fig, ax = plt.subplots(figsize=(8,4))
-                            ax.bar(years, cf)
-                            ax.set_xlabel("Year"); ax.set_ylabel("Cash Flow (USD)"); ax.set_title("Annual Cash Flow")
-                            ax.grid(True, alpha=0.3)
-                            st.pyplot(fig)
-                            cum = np.cumsum(cf)
-                            fig2, ax2 = plt.subplots(figsize=(8,4))
-                            ax2.plot(years, cum, marker="o"); ax2.axhline(0.0, linestyle="--", color="k", alpha=0.6)
-                            ax2.set_xlabel("Year"); ax2.set_ylabel("Cumulative Cash Flow (USD)"); ax2.set_title("Cumulative Cash Flow (Payback)")
-                            ax2.grid(True, alpha=0.3)
-                            st.pyplot(fig2)
-                        except Exception:
-                            pass
-                    try:
-                        out_serializable = {}
-                        for k, v in out.items():
-                            if isinstance(v, np.ndarray):
-                                out_serializable[k] = v.tolist()
-                            else:
-                                out_serializable[k] = v
-                        out_json = json.dumps(out_serializable, indent=2)
-                        st.download_button("Download TEA results (JSON)", out_json, file_name="tea_results.json", mime="application/json", key="download_tea_json")
-                    except Exception:
-                        st.info("Could not create download (some outputs may be non-serializable).")
-                else:
-                    st.error("TEA run failed; see error above.")
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+              "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan"]
 
-            if save_col.button("Save params JSON to file", key="save_params_btn"):
-                try:
-                    fname = os.path.join(tempfile.gettempdir(), "tea_params.json")
-                    with open(fname, "w") as fh:
-                        fh.write(json.dumps(base_params, indent=2))
-                    st.success(f"Saved params to {fname}")
-                except Exception as e:
-                    st.error(f"Could not save params file: {e}")
+    # CAPEX
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, CAPEX_vals, color=[colors[i % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("CAPEX (USD)")
+    plt.title("CAPEX comparison across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
-            st.subheader("Advanced analyses (if provided by script)")
-            ac1, ac2, ac3 = st.columns([1,1,1])
-            if ac1.button("Run ESG sweep visuals", key="esg_sweep_btn"):
-                if hasattr(comp_mod, "run_esg_sweep_and_plots"):
-                    try:
-                        comp_mod.run_esg_sweep_and_plots(base_params, design_label="Streamlit run")
-                        for num in plt.get_fignums():
-                            st.pyplot(plt.figure(num))
-                        st.success("ESG sweep completed.")
-                    except Exception as e:
-                        st.exception(f"ESG sweep failed: {e}")
-                else:
-                    st.warning("run_esg_sweep_and_plots not found in compliance script.")
-            if ac2.button("Price sweep (NPV & LCOx)", key="price_sweep_btn"):
-                if hasattr(comp_mod, "price_sweep"):
-                    try:
-                        comp_mod.price_sweep(base_params)
-                        for num in plt.get_fignums():
-                            st.pyplot(plt.figure(num))
-                        st.success("Price sweep completed.")
-                    except Exception as e:
-                        st.exception(f"price_sweep failed: {e}")
-                else:
-                    st.warning("price_sweep not found in compliance script.")
-            if ac3.button("Scenario CBA (3 scenarios)", key="scenario_cba_btn"):
-                if hasattr(comp_mod, "scenario_cba"):
-                    try:
-                        comp_mod.scenario_cba(base_params, design_label="Streamlit_run")
-                        for num in plt.get_fignums():
-                            st.pyplot(plt.figure(num))
-                        st.success("Scenario CBA completed.")
-                    except Exception as e:
-                        st.exception(f"scenario_cba failed: {e}")
-                else:
-                    st.warning("scenario_cba not found in compliance script.")
+    # LCOx
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, LCOx_vals, color=[colors[(i+2) % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("LCOx (USD/ton)")
+    plt.title("Levelised Cost comparison across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # NPV
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, NPV_vals, color=[colors[(i+4) % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("NPV (USD)")
+    plt.title("NPV comparison across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # IRR
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, IRR_vals, color=[colors[(i+6) % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("IRR (%)")
+    plt.title("IRR comparison across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # Payback
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, PB_vals, color=[colors[(i+8) % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("Payback time (years)")
+    plt.title("Payback comparison across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # BCR
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, BCR_vals, color=[colors[(i+1) % len(colors)] for i in range(len(idx))])
+    plt.axhline(1.0, linestyle="--", color="black", alpha=0.7, label="BCR = 1")
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("Benefit–Cost Ratio (-)")
+    plt.title("Benefit–Cost Ratio comparison across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # ROI total (Σ Net Income / CAPEX)
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, ROI_totals, color=[colors[(i+3) % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("Total ROI over life (%)")
+    plt.title("Total ROI (Σ Net Income / CAPEX) across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # Average annual ROI
+    plt.figure(figsize=(8, 4), dpi=200)
+    plt.bar(idx, ROI_avgs, color=[colors[(i+5) % len(colors)] for i in range(len(idx))])
+    plt.xticks(idx, labels, rotation=45)
+    plt.ylabel("Average annual ROI (%)")
+    plt.title("Average Annual ROI (mean Net Income / CAPEX) across designs")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
